@@ -902,14 +902,13 @@ usb_handle_mass_storage_reset(const struct usb_packet_setup *p, const void **dat
 static int
 usb_handle_get_max_lun(const struct usb_packet_setup *p, const void **data)
 {
-	static const uint16_t max_lun = 0;
-
 	if (p->wIndex != USBMS_INTERFACE)
 		return -1;
 
 	debug("GET_MAX_LUN\r\n");
-	*data = &max_lun;
-	return sizeof(max_lun);
+	usb_inbuf.u8[0] = 0;
+	*data = &usb_inbuf;
+	return 1;
 }
 
 enum dfu_status {
@@ -945,7 +944,7 @@ enum dfu_state {
 	DFU_dfuERROR,
 };
 
-static struct {
+static __align(4) struct {
 	uint8_t bStatus;
 	uint8_t bwPollTimeout[3];
 	uint8_t bState;
@@ -1063,7 +1062,8 @@ usb_handle_dfu_getstate(const struct usb_packet_setup *p, const void **data)
 		return -1;
 #endif
 
-	*data = &dfu_status.bState;
+	usb_inbuf.u8[0] = dfu_status.bState;
+	*data = &usb_inbuf;
 	return 1;
 }
 

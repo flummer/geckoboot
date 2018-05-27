@@ -32,13 +32,17 @@
 #define debug(...) printf(__VA_ARGS__)
 #endif
 
-#define USB_FIFO_RXSIZE  (256/sizeof(uint32_t))
-#define USB_FIFO_TX0SIZE ( 64/sizeof(uint32_t))
-#define USB_FIFO_TX1SIZE (256/sizeof(uint32_t))
-#define USB_FIFO_TX2SIZE (256/sizeof(uint32_t))
-#define USB_FIFO_TX3SIZE ( 64/sizeof(uint32_t))
+#define USB_FIFO_RXSIZE  256
+#define USB_FIFO_TX0SIZE 128
+#define USB_FIFO_TX1SIZE 128
+#define USB_FIFO_TX2SIZE 0
+#define USB_FIFO_TX3SIZE 0
 
-#define USB_EP1_PACKETSIZE 64
+#define USBMS_INTERFACE 0
+#define USBMS_ENDPOINT 1
+#define USBMS_PACKETSIZE 64
+
+#define DFU_INTERFACE 1
 
 #define USB_WORD(x) ((x) & 0xFF),((x) >> 8)
 
@@ -54,6 +58,9 @@
 #endif
 #define FLASH_ADDRESS      ((void *)FLASH_BASE)
 
+#define USB_GET_STATUS_DEVICE
+//#define USB_SET_INTERFACE
+
 //#define USBMS_BLOCKSIZE 512U
 #define USBMS_BLOCKSIZE 1024U
 
@@ -66,6 +73,8 @@
 #define USBMS_READ_FORMAT_CAPACITY
 //#define USBMS_REPORT_LUNS
 
+//#define DFU_STRICT
+//#define DFU_DETACH
 //#define DFU_UPLOAD
 //#define DFU_INTERFACE_NAME
 
@@ -217,7 +226,7 @@ static const __align(4) struct usb_descriptor_device usb_descriptor_device = {
 
 static const __align(4) struct usb_descriptor_configuration usb_descriptor_configuration1 = {
 	.bLength              = 9,
-	.bDescriptorType      = 2,
+	.bDescriptorType      = 0x02, /* Configuration */
 	.wTotalLength         = 50,
 	.bNumInterfaces       = 2,
 	.bConfigurationValue  = 1,
@@ -227,8 +236,8 @@ static const __align(4) struct usb_descriptor_configuration usb_descriptor_confi
 	.rest = {
 	/* Interface */
 	/* .bLength            */ 9,
-	/* .bDescriptorType    */ 4,
-	/* .bInterfaceNumber   */ 0,
+	/* .bDescriptorType    */ 0x04, /* Interface */
+	/* .bInterfaceNumber   */ USBMS_INTERFACE,
 	/* .bAlternateSetting  */ 0,
 	/* .bNumEndpoints      */ 2,
 	/* .bInterfaceClass    */ 0x08, /* 0x08 = Mass-Storage Class */
@@ -237,22 +246,22 @@ static const __align(4) struct usb_descriptor_configuration usb_descriptor_confi
 	/* .iInterface         */ 0,
 	/* Endpoint */
 	/* .bLength            */ 7,
-	/* .bDescriptorType    */ 5,
-	/* .bEndpointAddress   */ 0x81, /* IN, endpoint 1 */
+	/* .bDescriptorType    */ 0x05, /* Endpoint */
+	/* .bEndpointAddress   */ 0x80 | USBMS_ENDPOINT, /* in */
 	/* .bmAttributes       */ 0x02, /* bulk, data endpoint */
-	/* .wMaxPacketSize     */ USB_WORD(USB_EP1_PACKETSIZE),
+	/* .wMaxPacketSize     */ USB_WORD(USBMS_PACKETSIZE),
 	/* .bInterval          */ 0,    /* unused */
 	/* Endpoint */
 	/* .bLength            */ 7,
-	/* .bDescriptorType    */ 5,
-	/* .bEndpointAddress   */ 0x01, /* OUT, endpoint 1 */
+	/* .bDescriptorType    */ 0x05, /* Endpoint */
+	/* .bEndpointAddress   */ USBMS_ENDPOINT, /* out */
 	/* .bmAttributes       */ 0x02, /* bulk, data endpoint */
-	/* .wMaxPacketSize     */ USB_WORD(USB_EP1_PACKETSIZE),
+	/* .wMaxPacketSize     */ USB_WORD(USBMS_PACKETSIZE),
 	/* .bInterval          */ 0,    /* unused */
 	/* Interface */
 	/* .bLength            */ 9,
-	/* .bDescriptorType    */ 0x04, /* interface */
-	/* .bInterfaceNumber   */ 1,
+	/* .bDescriptorType    */ 0x04, /* Interface */
+	/* .bInterfaceNumber   */ DFU_INTERFACE,
 	/* .bAlternateSetting  */ 0,
 	/* .bNumEndpoints      */ 0,    /* only the control pipe is used */
 	/* .bInterfaceClass    */ 0xFE, /* application specific */
@@ -316,7 +325,7 @@ static const __align(4) struct usb_descriptor_string usb_descriptor_serial = {
 };
 
 #ifdef DFU_INTERFACE_NAME
-static const __align(4) struct usb_descriptor_string usb_descriptor_interface0 = {
+static const __align(4) struct usb_descriptor_string usb_descriptor_dfu_interface = {
 	.bLength         = 20,
 	.bDescriptorType = 3,
 	.wCodepoint = {
@@ -331,7 +340,7 @@ static const struct usb_descriptor_string *const usb_descriptor_string[] = {
 	&usb_descriptor_product,
 	&usb_descriptor_serial,
 #ifdef DFU_INTERFACE_NAME
-	&usb_descriptor_interface0,
+	&usb_descriptor_dfu_interface,
 #endif
 };
 
@@ -409,22 +418,25 @@ static const __align(4) struct format_capacity_data format_capacity_data = {
 };
 #endif
 
-enum usb_ep0_state {
-	USB_EP0_IDLE,
-	USB_EP0_SETUP,
-	USB_EP0_OUT,
-	USB_EP0_OUT_ACK,
-	USB_EP0_IN,
-	USB_EP0_IN_ACK,
-};
-
 static struct {
-	enum usb_ep0_state state;
 	uint32_t bytes;
 	uint32_t packetsize;
-} ep0state;
+#ifdef USB_FRAME_STATUS
+	uint32_t frame_status;
+#endif
+} usb_state;
 
-static __uninitialized uint32_t ep0buf[(4*sizeof(struct usb_packet_setup) + FLASH_PAGE_SIZE)/sizeof(uint32_t)];
+static __uninitialized uint32_t usb_outbuf[
+	(4*sizeof(struct usb_packet_setup) + FLASH_PAGE_SIZE) / sizeof(uint32_t)
+];
+static __uninitialized union {
+	int8_t    i8[4];
+	uint8_t   u8[4];
+	int16_t  i16[2];
+	uint16_t u16[2];
+	int32_t  i32[1];
+	uint32_t u32[1];
+} usb_inbuf;
 
 enum usbms_state {
 	USBMS_STATE_CBW,
@@ -449,8 +461,8 @@ static struct {
 static __uninitialized union {
 	struct command_block_wrapper cbw;
 	struct command_status_wrapper csw;
-	uint8_t byte[USB_EP1_PACKETSIZE];
-	uint32_t word[USB_EP1_PACKETSIZE/sizeof(uint32_t)];
+	uint8_t byte[USBMS_PACKETSIZE];
+	uint32_t word[USBMS_PACKETSIZE/sizeof(uint32_t)];
 } usbms_buf;
 
 static unsigned int reboot_flag;
@@ -496,15 +508,6 @@ _write(int fd, const uint8_t *ptr, size_t len)
 
 	return len;
 }
-
-static const char *const usb_ep0_state_string[] = {
-	[USB_EP0_IDLE]    = "idle",
-	[USB_EP0_SETUP]   = "setup",
-	[USB_EP0_OUT]     = "out",
-	[USB_EP0_OUT_ACK] = "out-ack",
-	[USB_EP0_IN]      = "in",
-	[USB_EP0_IN_ACK]  = "in-ack",
-};
 #endif
 
 static __noreturn void
@@ -611,9 +614,9 @@ usb_unsuspend(void)
 	while (usb_core_resetting())
 		/* wait */;
 
-	/* SiliconLabs code delays around 1us here */
+	/* SiliconLabs code delay around 1us here */
 
-	/* Wait for AHB master IDLE state. */
+	/* wait for AHB master IDLE state */
 	while (!usb_ahb_idle())
 		/* wait */;
 
@@ -636,46 +639,34 @@ usb_unsuspend(void)
 	          | USB_DCFG_NZSTSOUTHSHK
 	          | USB_DCFG_DEVSPD_FS;
 
-	/* ignore frame numbers on ISO transfers. */
+	/* ignore frame numbers on iso transfers */
 	USB->DCTL = USB_DCTL_IGNRFRMNUM
 	          | USB_DCTL_PWRONPRGDONE
+	          | USB_DCTL_CGOUTNAK
 	          | USB_DCTL_SFTDISCON;
 
 	/* setup fifo allocation */
-	USB->GRXFSIZ = USB_FIFO_RXSIZE;
-	USB->GNPTXFSIZ = (USB_FIFO_TX0SIZE << 16)
-	               | (USB_FIFO_RXSIZE);
-	USB->DIEPTXF1  = (USB_FIFO_TX1SIZE << 16)
-	               | (USB_FIFO_RXSIZE+USB_FIFO_TX0SIZE);
-	USB->DIEPTXF2  = (USB_FIFO_TX2SIZE << 16)
-	               | (USB_FIFO_RXSIZE+USB_FIFO_TX0SIZE+USB_FIFO_TX1SIZE);
-	USB->DIEPTXF3  = (USB_FIFO_TX3SIZE << 16)
-	               | (USB_FIFO_RXSIZE+USB_FIFO_TX0SIZE+USB_FIFO_TX1SIZE+USB_FIFO_TX2SIZE);
+	usb_allocate_buffers(USB_FIFO_RXSIZE,
+			USB_FIFO_TX0SIZE,
+			USB_FIFO_TX1SIZE,
+			USB_FIFO_TX2SIZE,
+			USB_FIFO_TX3SIZE);
 
 	/* stop all endpoints */
-	USB->DOEP0CTL = USB_DOEP0CTL_SNAK
-	              | USB_DOEP0CTL_STALL
-	              | USB_DOEP0CTL_EPTYPE_DEFAULT
-	              | USB_DOEP0CTL_USBACTEP
-	              | USB_DOEP0CTL_MPS_64B;
-	USB->DOEP[0].CTL = USB_DOEP_CTL_SNAK;
-	USB->DOEP[1].CTL = USB_DOEP_CTL_SNAK;
-	USB->DOEP[2].CTL = USB_DOEP_CTL_SNAK;
+	USB->DOEP0CTL = USB_DOEP0CTL_STALL | USB_DOEP0CTL_MPS_64B;
+	for (unsigned int i = 0; i < 3; i++)
+		USB->DOEP[i].CTL = USB_DOEP_CTL_SNAK;
 
-	USB->DIEP0CTL = USB_DIEP0CTL_SNAK
-	              | USB_DIEP0CTL_STALL
+	USB->DIEP0CTL = USB_DIEP0CTL_STALL
 	              | (0 << _USB_DIEP0CTL_TXFNUM_SHIFT)
-	              | USB_DIEP0CTL_EPTYPE_DEFAULT
-	              | USB_DIEP0CTL_USBACTEP
 	              | USB_DIEP0CTL_MPS_64B;
-	USB->DIEP[0].CTL = USB_DIEP_CTL_SNAK;
-	USB->DIEP[1].CTL = USB_DIEP_CTL_SNAK;
-	USB->DIEP[2].CTL = USB_DIEP_CTL_SNAK;
-
-	usb_connect();
+	for (unsigned int i = 0; i < 3; i++)
+		USB->DIEP[i].CTL = USB_DIEP_CTL_SNAK;
 
 	/* enable interrupt */
 	NVIC_EnableIRQ(USB_IRQn);
+
+	usb_connect();
 }
 
 static void
@@ -685,17 +676,15 @@ usb_reset(void)
 		reboot();
 
 	/* configure DMA for endpoint 0 */
-	usb_ep0out_prepare_setup(&ep0buf);
+	usb_ep0out_prepare_setup(&usb_outbuf);
 
 	/* stop all endpoints */
-	USB->DOEP[0].CTL = USB_DOEP_CTL_SNAK;
-	USB->DOEP[1].CTL = USB_DOEP_CTL_SNAK;
-	USB->DOEP[2].CTL = USB_DOEP_CTL_SNAK;
+	for (unsigned int i = 0; i < 3; i++)
+		USB->DOEP[i].CTL = USB_DOEP_CTL_SNAK;
 
 	usb_ep0in_stall();
-	USB->DIEP[0].CTL = USB_DIEP_CTL_SNAK;
-	USB->DIEP[1].CTL = USB_DIEP_CTL_SNAK;
-	USB->DIEP[2].CTL = USB_DIEP_CTL_SNAK;
+	for (unsigned int i = 0; i < 3; i++)
+		USB->DIEP[i].CTL = USB_DIEP_CTL_SNAK;
 
 	/* enable interrupts for endpoint 0 only */
 	USB->DAINTMSK = USB_DAINTMSK_INEPMSK0 | USB_DAINTMSK_OUTEPMSK0;
@@ -704,9 +693,7 @@ usb_reset(void)
 	USB->DIEPMSK = USB_DIEPMSK_XFERCOMPLMSK
 	             | USB_DIEPMSK_TIMEOUTMSK;
 
-	ep0state.state = USB_EP0_SETUP;
-	ep0state.bytes = 0;
-
+	usb_state.bytes = 0;
 #if 0
 	/* flush fifos */
 	usb_fifo_flush();
@@ -725,47 +712,40 @@ usb_enumdone(void)
 		return;
 	case 2:
 		debug("low speed.. ");
-#if 0
-		USB->DOEP0CTL = USB_DOEP0CTL_EPENA
-		              | USB_DOEP0CTL_SNAK
-		              | USB_DOEP0CTL_USBACTEP
-		              | USB_DOEP0CTL_MPS_8B;
-		USB->DIEP0CTL = USB_DIEP0CTL_SNAK
-		              | USB_DIEP0CTL_STALL
-		              | (0 << _USB_DIEP0CTL_TXFNUM_SHIFT)
-		              | USB_DIEP0CTL_EPTYPE_DEFAULT
-		              | USB_DIEP0CTL_USBACTEP
+		/* use 8 byte packages */
+		USB->DOEP0CTL = USB_DOEP0CTL_MPS_8B;
+		USB->DIEP0CTL = (0 << _USB_DIEP0CTL_TXFNUM_SHIFT)
 		              | USB_DIEP0CTL_MPS_8B;
 
-		ep0state.state = USB_EP0_SETUP;
-#endif
-		ep0state.packetsize = 8;
+		usb_state.packetsize = 8;
 		break;
 	case 3:
 		debug("full speed.. ");
-#if 0
-		USB->DOEP0CTL = USB_DOEP0CTL_EPENA
-		              | USB_DOEP0CTL_SNAK
-		              | USB_DOEP0CTL_USBACTEP
-		              | USB_DOEP0CTL_MPS_64B;
-		USB->DIEP0CTL = USB_DIEP0CTL_SNAK
-		              | USB_DIEP0CTL_STALL
-		              | (0 << _USB_DIEP0CTL_TXFNUM_SHIFT)
-		              | USB_DIEP0CTL_EPTYPE_DEFAULT
-		              | USB_DIEP0CTL_USBACTEP
-		              | USB_DIEP0CTL_MPS_64B;
-
-		ep0state.state = USB_EP0_SETUP;
-#endif
-		ep0state.packetsize = 64;
+		/* we already set 64 byte packages at reset */
+		usb_state.packetsize = 64;
 		break;
 	}
 }
+
+#ifdef USB_GET_STATUS_DEVICE
+static int
+usb_handle_get_status_device(const struct usb_packet_setup *p, const void **data)
+{
+	debug("GET_STATUS device\r\n");
+	usb_inbuf.u16[0] = 0;
+	*data = &usb_inbuf;
+	return 2;
+}
+#endif
 
 static int
 usb_handle_set_address(const struct usb_packet_setup *p, const void **data)
 {
 	debug("SET_ADDRESS: wValue = %hu\r\n", p->wValue);
+
+	if (p->wLength != 0)
+		return -1;
+
 	reboot_on_reset = true;
 	usb_set_address(p->wValue);
 	return 0;
@@ -831,6 +811,7 @@ usb_handle_get_descriptor(const struct usb_packet_setup *p, const void **data)
 		break;
 	default:
 		debug("GET_DESCRIPTOR: unknown type 0x%02x\r\n", type);
+		dumpsetup(p);
 		break;
 	}
 	return -1;
@@ -840,42 +821,80 @@ static int
 usb_handle_get_configuration(const struct usb_packet_setup *p, const void **data)
 {
 	debug("GET_CONFIGURATION\r\n");
-	*data = &usb_descriptor_configuration[0]->bConfigurationValue;
+	usb_inbuf.u8[0] = usb_descriptor_configuration[0]->bConfigurationValue;
+	*data = &usb_inbuf;
 	return 1;
 }
 
 static int
 usb_handle_set_configuration(const struct usb_packet_setup *p, const void **data)
 {
-	debug("SET_CONFIGURATION: wValue = %hu\r\n", p->wValue);
+	debug("SET_CONFIGURATION: wIndex = %hu, wValue = %hu\r\n",
+			p->wIndex, p->wValue);
 
-	USB->DAINTMSK |= USB_DAINTMSK_INEPMSK1 | USB_DAINTMSK_OUTEPMSK1;
-	/* configure endpoint 1 */
-	USB->DIEP[0].CTL = USB_DIEP_CTL_SNAK
-	                 | (1 << _USB_DIEP_CTL_TXFNUM_SHIFT)
-	                 | USB_DIEP_CTL_EPTYPE_BULK
-	                 | USB_DIEP_CTL_USBACTEP
-	                 | USB_EP1_PACKETSIZE;
-	usb_ep_out_dma_address_set(0, &usbms_buf);
-	usb_ep_out_transfer_size(0, 1, USB_EP1_PACKETSIZE);
-	USB->DOEP[0].CTL = USB_DOEP_CTL_EPENA
-	                 | USB_DOEP_CTL_CNAK
-	                 | USB_DOEP_CTL_EPTYPE_BULK
-	                 | USB_DOEP_CTL_USBACTEP
-	                 | USB_EP1_PACKETSIZE;
-	return 0;
+	if (p->wLength != 0)
+		return -1;
+
+	if (p->wValue == usb_descriptor_configuration[0]->bConfigurationValue) {
+		/* configure mass-storage bulk endpoints */
+		USB->DIEP[USBMS_ENDPOINT-1].CTL = USB_DIEP_CTL_SNAK
+			| (USBMS_ENDPOINT << _USB_DIEP_CTL_TXFNUM_SHIFT)
+			| USB_DIEP_CTL_EPTYPE_BULK
+			| USB_DIEP_CTL_USBACTEP
+			| USBMS_PACKETSIZE;
+		usb_ep_out_dma_address_set(USBMS_ENDPOINT, &usbms_buf);
+		usb_ep_out_transfer_size(USBMS_ENDPOINT, 1, USBMS_PACKETSIZE);
+		USB->DOEP[USBMS_ENDPOINT-1].CTL = USB_DOEP_CTL_EPENA
+			| USB_DOEP_CTL_CNAK
+			| USB_DOEP_CTL_EPTYPE_BULK
+			| USB_DOEP_CTL_USBACTEP
+			| USBMS_PACKETSIZE;
+
+		USB->DAINTMSK |= USB_DAINTMSK_INEPMSK1 | USB_DAINTMSK_OUTEPMSK1;
+		return 0;
+	}
+
+	return -1;
 }
 
+#ifdef USB_SET_INTERFACE
 static int
-usb_handle_clear_features(const struct usb_packet_setup *p, const void **data)
+usb_handle_set_interface(const struct usb_packet_setup *p, const void **data)
 {
-	debug("CLEAR_FEATURES\r\n");
-	return 0;
+	debug("SET_INTERFACE: wIndex = %hu, wValue = %hu\r\n", p->wIndex, p->wValue);
+
+	if (p->wLength != 0)
+		return -1;
+
+	if (p->wIndex == USBMS_INTERFACE && p->wValue == 0)
+		return 0;
+	if (p->wIndex == DFU_INTERFACE && p->wValue == 0)
+		return 0;
+
+	return -1;
+}
+#endif
+
+static int
+usb_handle_clear_feature_endpoint(const struct usb_packet_setup *p, const void **data)
+{
+	debug("CLEAR_FEATURE endpoint %hu\r\n", p->wIndex);
+
+	if (p->wLength != 0)
+		return -1;
+
+	if (p->wIndex == USBMS_ENDPOINT)
+		return 0;
+
+	return -1;
 }
 
 static int
 usb_handle_mass_storage_reset(const struct usb_packet_setup *p, const void **data)
 {
+	if (p->wIndex != USBMS_INTERFACE || p->wLength != 0)
+		return -1;
+
 	debug("MASS_STORAGE_RESET\r\n");
 	return 0;
 }
@@ -884,6 +903,9 @@ static int
 usb_handle_get_max_lun(const struct usb_packet_setup *p, const void **data)
 {
 	static const uint16_t max_lun = 0;
+
+	if (p->wIndex != USBMS_INTERFACE)
+		return -1;
 
 	debug("GET_MAX_LUN\r\n");
 	*data = &max_lun;
@@ -930,21 +952,32 @@ static struct {
 	uint8_t iString;
 } dfu_status;
 
-/*
+#ifdef DFU_DETACH
 static int
 usb_handle_dfu_detach(const struct usb_packet_setup *p, const void **data)
 {
 	debug("DFU_DETACH: wValue = %hu, wIndex = %hu, wLength = %hu\r\n",
 			p->wValue, p->wIndex, p->wLength);
+
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
+
 	return 0;
 }
-*/
+#endif
 
 static int
 usb_handle_dfu_dnload(const struct usb_packet_setup *p, const void **data)
 {
 	debug("DFU_DNLOAD: wValue = %hu, wIndex = %hu, wLength = %hu\r\n",
 			p->wValue, p->wIndex, p->wLength);
+
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
 
 	if (p->wLength == 0) {
 		dfu_status.bState = DFU_dfuIDLE;
@@ -975,6 +1008,11 @@ usb_handle_dfu_upload(const struct usb_packet_setup *p, const void **data)
 	debug("DFU_UPLOAD: wValue = %hu, wIndex = %hu, wLength = %hu\r\n",
 			p->wValue, p->wIndex, p->wLength);
 
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
+
 	if (p->wValue < (FLASH_TOTAL_PAGES - FLASH_PAGE_OFFSET)) {
 		dfu_status.bState = DFU_dfuUPLOAD_IDLE;
 		*data = FLASH_ADDRESS + (FLASH_PAGE_OFFSET + p->wValue) * FLASH_PAGE_SIZE;
@@ -990,6 +1028,12 @@ static int
 usb_handle_dfu_getstatus(const struct usb_packet_setup *p, const void **data)
 {
 	debug("DFU_GETSTATUS\r\n");
+
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
+
 	*data = &dfu_status;
 	return sizeof(dfu_status);
 }
@@ -998,6 +1042,12 @@ static int
 usb_handle_dfu_clrstatus(const struct usb_packet_setup *p, const void **data)
 {
 	debug("DFU_CLRSTATUS\r\n");
+
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
+
 	dfu_status.bStatus = DFU_OK;
 	dfu_status.bState = DFU_dfuIDLE;
 	return 0;
@@ -1007,6 +1057,12 @@ static int
 usb_handle_dfu_getstate(const struct usb_packet_setup *p, const void **data)
 {
 	debug("DFU_GETSTATE\r\n");
+
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
+
 	*data = &dfu_status.bState;
 	return 1;
 }
@@ -1015,6 +1071,12 @@ static int
 usb_handle_dfu_abort(const struct usb_packet_setup *p, const void **data)
 {
 	debug("DFU_ABORT\r\n");
+
+#ifdef DFU_STRICT
+	if (p->wIndex != DFU_INTERFACE)
+		return -1;
+#endif
+
 	return 0;
 }
 
@@ -1024,14 +1086,22 @@ struct usb_setup_handler {
 };
 
 static const struct usb_setup_handler usb_setup_handlers[] = {
+#ifdef USB_GET_STATUS_DEVICE
+	{ .req = 0x0080, .fn = usb_handle_get_status_device },
+#endif
 	{ .req = 0x0500, .fn = usb_handle_set_address },
 	{ .req = 0x0680, .fn = usb_handle_get_descriptor },
 	{ .req = 0x0880, .fn = usb_handle_get_configuration },
 	{ .req = 0x0900, .fn = usb_handle_set_configuration },
-	{ .req = 0x0102, .fn = usb_handle_clear_features },
-	{ .req = 0xFF21, .fn = usb_handle_mass_storage_reset },
-	{ .req = 0xFEA1, .fn = usb_handle_get_max_lun, },
-	/* { .req = 0x0021, .fn = usb_handle_dfu_detach }, */
+#ifdef USB_SET_INTERFACE
+	{ .req = 0x0b01, .fn = usb_handle_set_interface },
+#endif
+	{ .req = 0x0102, .fn = usb_handle_clear_feature_endpoint },
+	{ .req = 0xff21, .fn = usb_handle_mass_storage_reset },
+	{ .req = 0xfea1, .fn = usb_handle_get_max_lun, },
+#ifdef DFU_DETACH
+	{ .req = 0x0021, .fn = usb_handle_dfu_detach },
+#endif
 	{ .req = 0x0121, .fn = usb_handle_dfu_dnload },
 #ifdef DFU_UPLOAD
 	{ .req = 0x02a1, .fn = usb_handle_dfu_upload },
@@ -1061,10 +1131,10 @@ usb_setup_handler_run(const struct usb_packet_setup *p, const void **data)
 static void
 usb_handle_setup(void)
 {
-	const struct usb_packet_setup *p;
+	const struct usb_packet_setup *p =
+		usb_ep0out_dma_address() - sizeof(struct usb_packet_setup);
 
-	p = (struct usb_packet_setup *)
-	    (usb_ep0out_dma_address() - sizeof(struct usb_packet_setup));
+	usb_state.bytes = 0;
 
 	if (p->bmRequestType & 0x80U) {
 		const void *data;
@@ -1074,151 +1144,101 @@ usb_handle_setup(void)
 			/* send IN data */
 			if (ret > p->wLength)
 				ret = p->wLength;
-			ep0state.bytes = ret;
-			if ((uint32_t)ret > ep0state.packetsize)
-				ret = ep0state.packetsize;
+			usb_state.bytes = ret;
+			if ((uint32_t)ret > usb_state.packetsize)
+				ret = usb_state.packetsize;
 			usb_ep0in_dma_address_set(data);
 			usb_ep0in_transfer_size(1, ret);
 			usb_ep0in_enable();
 			/* prepare for IN ack */
-			usb_ep0out_dma_address_set(&ep0buf);
-			usb_ep0out_transfer_size(1, ep0state.packetsize);
+			usb_ep0out_dma_address_set(&usb_outbuf);
+			usb_ep0out_transfer_size(1, usb_state.packetsize);
 			usb_ep0out_enable();
-			ep0state.state = USB_EP0_IN;
 			return;
 		}
 	} else if (p->wLength == 0) {
-		const void *data;
-		int ret = usb_setup_handler_run(p, &data);
-
-		if (ret >= 0) {
-			/* prepare for next SETUP package */
-			usb_ep0out_prepare_setup(&ep0buf);
+		if (!usb_setup_handler_run(p, NULL)) {
 			/* send empty ack package */
 			usb_ep0in_transfer_size(1, 0);
 			usb_ep0in_enable();
-			ep0state.state = USB_EP0_OUT_ACK;
+			/* prepare for next SETUP package */
+			usb_ep0out_prepare_setup(&usb_outbuf);
 			return;
 		}
-	} else if (p->wLength <= sizeof(ep0buf) - 4*sizeof(struct usb_packet_setup)) {
+	} else if (p->wLength <= sizeof(usb_outbuf) - 4*sizeof(struct usb_packet_setup)) {
 		uint32_t *rp = (uint32_t *)p;
 
-		if (rp != &ep0buf[0]) {
-			ep0buf[0] = rp[0];
-			ep0buf[1] = rp[1];
+		if (rp != &usb_outbuf[0]) {
+			usb_outbuf[0] = rp[0];
+			usb_outbuf[1] = rp[1];
 		}
 
 		/* receive OUT data */
-		usb_ep0out_dma_address_set(&ep0buf[2]);
-		usb_ep0out_transfer_size(1, ep0state.packetsize);
+		usb_ep0out_dma_address_set(&usb_outbuf[2]);
+		usb_ep0out_transfer_size(1, usb_state.packetsize);
 		usb_ep0out_enable();
-		ep0state.bytes = p->wLength;
-		ep0state.state = USB_EP0_OUT;
+		usb_state.bytes = p->wLength;
 		return;
 	}
 
 	/* stall IN endpoint */
 	usb_ep0in_stall();
 	/* prepare for next SETUP package */
-	usb_ep0out_prepare_setup(&ep0buf);
-	ep0state.state = USB_EP0_SETUP;
+	usb_ep0out_prepare_setup(&usb_outbuf);
 }
 
 static void
-usb_handle_ep0_in(void)
+usb_handle_ep0(void)
 {
-	uint32_t flags = usb_ep0in_flags();
+	uint32_t oflags = usb_ep0out_flags();
+	uint32_t iflags = usb_ep0in_flags();
 	uint32_t bytes;
 
-#if 0
-	debug("EP0IN  %7s 0x%04lx OUT:0x%08lx IN:0x%08lx\r\n",
-			usb_ep0_state_string[ep0state.state], flags,
-			USB->DOEP0CTL, USB->DIEP0CTL);
-#endif
+	usb_ep0out_flags_clear(oflags);
+	usb_ep0in_flags_clear(iflags);
 
-	usb_ep0in_flags_clear(flags);
+	debug("EP0 %04lx %04lx %lu\r\n", oflags, iflags, usb_state.bytes);
 
-	switch (ep0state.state) {
-	case USB_EP0_OUT_ACK:
-		ep0state.state = USB_EP0_SETUP;
-		break;
-	case USB_EP0_IN:
-		bytes = ep0state.bytes;
-		if (bytes > ep0state.packetsize) {
-			bytes -= ep0state.packetsize;
-			ep0state.bytes = bytes;
-			/* send next package */
-			if (bytes > ep0state.packetsize)
-				bytes = ep0state.packetsize;
-			usb_ep0in_transfer_size(1, bytes);
-			usb_ep0in_enable();
-		} else
-			ep0state.state = USB_EP0_IN_ACK;
-		break;
-	default:
-		debug("EP0IN: Invalid state %s\r\n",
-				usb_ep0_state_string[ep0state.state]);
-		usb_flags_enable(0);
-	}
-}
-
-static void
-usb_handle_ep0_out(void)
-{
-	uint32_t flags = usb_ep0out_flags();
-	uint32_t bytes;
-
-#if 0
-	debug("EP0OUT %7s 0x%04lx OUT:0x%08lx IN:0x%08lx\r\n",
-			usb_ep0_state_string[ep0state.state], flags,
-			USB->DOEP0CTL, USB->DIEP0CTL);
-#endif
-
-	usb_ep0out_flags_clear(flags);
-
-	if (usb_ep0out_flag_setup(flags)) {
+	if (usb_ep0out_flag_setup(oflags)) {
 		usb_handle_setup();
 		return;
 	}
 
-	if (!usb_ep0out_flag_complete(flags))
+	bytes = usb_state.bytes;
+	if (bytes == 0)
 		return;
 
-	switch (ep0state.state) {
-	case USB_EP0_SETUP:
-	case USB_EP0_OUT_ACK:
-		/* SETUP flag not set yet */
-		break;
-	case USB_EP0_IN_ACK:
-		ep0state.state = USB_EP0_SETUP;
-		break;
-	case USB_EP0_OUT:
-		bytes = ep0state.packetsize - usb_ep0out_bytes_left();
-		ep0state.bytes -= bytes;
-		if (ep0state.bytes > 0) {
+	if (usb_ep0in_flag_complete(iflags)) {
+		/* data IN */
+		if (bytes > usb_state.packetsize) {
+			/* send next package */
+			bytes -= usb_state.packetsize;
+			usb_state.bytes = bytes;
+			if (bytes > usb_state.packetsize)
+				bytes = usb_state.packetsize;
+			usb_ep0in_transfer_size(1, bytes);
+			usb_ep0in_enable();
+		} else
+			usb_state.bytes = 0;
+	} else if (usb_ep0out_flag_complete(oflags)) {
+		/* data OUT */
+		bytes = usb_state.packetsize - usb_ep0out_bytes_left();
+		usb_state.bytes -= bytes;
+		if (usb_state.bytes > 0) {
 			/* prepare for more OUT data */
-			usb_ep0out_transfer_size(1, ep0state.packetsize);
+			usb_ep0out_transfer_size(1, usb_state.packetsize);
 			usb_ep0out_enable();
 		} else {
-			const void *data = &ep0buf[2];
+			const void *data = &usb_outbuf[2];
 
-			if (usb_setup_handler_run((const void *)&ep0buf, &data) >= 0) {
+			if (!usb_setup_handler_run((const void *)&usb_outbuf, &data)) {
 				/* send empty ack package */
 				usb_ep0in_transfer_size(1, 0);
 				usb_ep0in_enable();
-				ep0state.state = USB_EP0_OUT_ACK;
-			} else {
-				/* stall IN endpoint */
+			} else
 				usb_ep0in_stall();
-				ep0state.state = USB_EP0_SETUP;
-			}
+			usb_ep0out_prepare_setup(&usb_outbuf);
 		}
-		break;
-	default:
-		debug("EP0OUT: Invalid state %s\r\n",
-				usb_ep0_state_string[ep0state.state]);
-		usb_flags_enable(0);
-		break;
 	}
 }
 
@@ -1664,12 +1684,12 @@ found:
 }
 
 static void
-usb_handle_ep1_in(void)
+usb_handle_mass_storage_in(void)
 {
-	uint32_t flags = usb_ep_in_flags(0);
+	uint32_t flags = usb_ep_in_flags(USBMS_ENDPOINT);
 	uint32_t packets;
 
-	usb_ep_in_flags_clear(0, flags);
+	usb_ep_in_flags_clear(USBMS_ENDPOINT, flags);
 
 	usbms.bytes -= usbms.chunk;
 	usbms_buf.csw.dCSWDataResidue -= usbms.chunk;
@@ -1690,42 +1710,42 @@ usb_handle_ep1_in(void)
 			if (reboot_flag > 2)
 				reboot();
 			usbms.state = USBMS_STATE_CBW;
-			usb_ep_out_dma_address_set(0, &usbms_buf);
-			usb_ep_out_transfer_size(0, 1, USB_EP1_PACKETSIZE);
-			usb_ep_out_enable(0);
+			usb_ep_out_dma_address_set(USBMS_ENDPOINT, &usbms_buf);
+			usb_ep_out_transfer_size(USBMS_ENDPOINT, 1, USBMS_PACKETSIZE);
+			usb_ep_out_enable(USBMS_ENDPOINT);
 			break;
 		}
-		packets = (usbms.chunk + USB_EP1_PACKETSIZE - 1) / USB_EP1_PACKETSIZE;
-		usb_ep_in_dma_address_set(0, usbms.data);
-		usb_ep_in_transfer_size(0, packets, usbms.chunk);
-		usb_ep_in_enable(0);
+		packets = (usbms.chunk + USBMS_PACKETSIZE - 1) / USBMS_PACKETSIZE;
+		usb_ep_in_dma_address_set(USBMS_ENDPOINT, usbms.data);
+		usb_ep_in_transfer_size(USBMS_ENDPOINT, packets, usbms.chunk);
+		usb_ep_in_enable(USBMS_ENDPOINT);
 		break;
 	default:
 		debug("TX: error %hu\r\n", usbms.state);
 		usbms.state = USBMS_STATE_ERROR;
-		usb_ep_in_stall(0);
+		usb_ep_in_stall(USBMS_ENDPOINT);
 	}
 }
 
 static void
-usb_handle_ep1_out(void)
+usb_handle_mass_storage_out(void)
 {
-	uint32_t flags = usb_ep_out_flags(0);
+	uint32_t flags = usb_ep_out_flags(USBMS_ENDPOINT);
 	uint32_t len;
 	uint32_t packets;
 
-	usb_ep_out_flags_clear(0, flags);
+	usb_ep_out_flags_clear(USBMS_ENDPOINT, flags);
 
 	switch (usbms.state) {
 	case USBMS_STATE_CBW:
-		len = USB_EP1_PACKETSIZE - (USB->DOEP[0].TSIZ & _USB_DOEP_TSIZ_XFERSIZE_MASK);
+		len = USBMS_PACKETSIZE - usb_ep_out_bytes_left(USBMS_ENDPOINT);
 		if (len == 31 && usbms_buf.word[0] == 0x43425355)
 			usbms.state = usbms_handle_cbw();
 		else
 			usbms.state = USBMS_STATE_ERROR;
 		break;
 	case USBMS_STATE_DATA_OUT:
-		if (USB->DOEP[0].TSIZ) {
+		if (USB->DOEP[USBMS_ENDPOINT-1].TSIZ) {
 			usbms.state = USBMS_STATE_ERROR;
 			break;
 		}
@@ -1747,42 +1767,40 @@ usb_handle_ep1_out(void)
 
 	switch (usbms.state) {
 	case USBMS_STATE_DATA_OUT:
-		packets = (usbms.chunk + USB_EP1_PACKETSIZE - 1) / USB_EP1_PACKETSIZE;
-		usb_ep_out_dma_address_set(0, usbms.buf);
-		usb_ep_out_transfer_size(0, packets, usbms.chunk);
-		usb_ep_out_enable(0);
+		packets = (usbms.chunk + USBMS_PACKETSIZE - 1) / USBMS_PACKETSIZE;
+		usb_ep_out_dma_address_set(USBMS_ENDPOINT, usbms.buf);
+		usb_ep_out_transfer_size(USBMS_ENDPOINT, packets, usbms.chunk);
+		usb_ep_out_enable(USBMS_ENDPOINT);
 		break;
 	case USBMS_STATE_CSW:
 		usbms.data = &usbms_buf.csw;
 		usbms.bytes = usbms.chunk = 13;
 		/* fallthrough */
 	case USBMS_STATE_DATA_IN:
-		packets = (usbms.chunk + USB_EP1_PACKETSIZE - 1) / USB_EP1_PACKETSIZE;
-		usb_ep_in_dma_address_set(0, usbms.data);
-		usb_ep_in_transfer_size(0, packets, usbms.chunk);
-		usb_ep_in_enable(0);
+		packets = (usbms.chunk + USBMS_PACKETSIZE - 1) / USBMS_PACKETSIZE;
+		usb_ep_in_dma_address_set(USBMS_ENDPOINT, usbms.data);
+		usb_ep_in_transfer_size(USBMS_ENDPOINT, packets, usbms.chunk);
+		usb_ep_in_enable(USBMS_ENDPOINT);
 		break;
 	default:
 		debug("RX: error %hu\r\n", usbms.state);
 		usbms.state = USBMS_STATE_ERROR;
-		usb_ep_in_stall(0);
+		usb_ep_in_stall(USBMS_ENDPOINT);
 		break;
 	}
 }
 
 static void
-usb_handle_transfer(void)
+usb_handle_endpoints(void)
 {
 	uint32_t flags = usb_ep_flags();
 
-	if (flags & USB_DAINT_INEPINT0)
-		usb_handle_ep0_in();
-	if (flags & USB_DAINT_OUTEPINT0)
-		usb_handle_ep0_out();
-	if (flags & USB_DAINT_INEPINT1)
-		usb_handle_ep1_in();
-	if (flags & USB_DAINT_OUTEPINT1)
-		usb_handle_ep1_out();
+	if (usb_ep_flag_in_or_out(0, flags))
+		usb_handle_ep0();
+	if (usb_ep_flag_in(USBMS_ENDPOINT, flags))
+		usb_handle_mass_storage_in();
+	if (usb_ep_flag_out(USBMS_ENDPOINT, flags))
+		usb_handle_mass_storage_out();
 }
 
 void
@@ -1794,9 +1812,14 @@ USB_IRQHandler(void)
 
 	gpio_clear(LED_GREEN);
 
-	if (usb_flag_ep(flags)) {
-		usb_handle_transfer();
-	}
+#ifdef USB_FRAME_STATUS
+	if (usb_flag_sof(flags))
+		usb_state.frame_status = usb_device_status();
+#endif
+
+	if (usb_flag_ep(flags))
+		usb_handle_endpoints();
+
 	if (flags & (USB_GINTSTS_RESETDET | USB_GINTSTS_WKUPINT)) {
 		debug("WAKEUP.. ");
 		usb_unsuspend();
@@ -1804,7 +1827,6 @@ USB_IRQHandler(void)
 		goto out;
 	}
 	if (usb_flag_suspend(flags)) {
-		//if ((flags & USB_GINTSTS_USBSUSP) || (USB->DSTS & USB_DSTS_ERRTICERR)) {
 		debug("SUSPEND.. ");
 		usb_suspend();
 		debug("done\r\n");
@@ -1872,7 +1894,9 @@ block_dump(uint8_t *page)
 static void
 usb_init(void)
 {
-	/* NVIC_SetPriority(USB_IRQn, 0); */
+#ifndef NDEBUG
+	NVIC_SetPriority(USB_IRQn, 0);
+#endif
 
 	/* enable USB clock */
 	clock_usb_enable();
@@ -1932,18 +1956,17 @@ main(void)
 	clock_hfrco_disable();
 	clock_auxhfrco_enable();
 
+	clock_le_enable();
 #ifdef NDEBUG
 	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_DISABLED | CLOCK_LFC_LFRCO);
-	clock_usble_enable();
 #else
 	/* route 24MHz core clock / 2 / 8 to LEUART0 */
-	//clock_le_div2();
-	clock_le_enable();
+	/* clock_le_div2(); bootup default */
 	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_CORECLK | CLOCK_LFC_LFRCO);
 	clock_leuart0_div8();
 	clock_leuart0_enable();
-	clock_usble_enable();
 #endif
+	clock_usble_enable();
 	while (clock_lf_syncbusy())
 		/* wait */;
 
@@ -1969,7 +1992,7 @@ main(void)
 		/* wait */;
 
 	/* enable interrupt */
-	//NVIC_SetPriority(LEUART0_IRQn, 0);
+	NVIC_SetPriority(LEUART0_IRQn, 1);
 	NVIC_EnableIRQ(LEUART0_IRQn);
 #endif
 
@@ -1988,6 +2011,7 @@ main(void)
 			block_dump(fat12.byte);
 	}
 #else
+	/* sleep when not interrupted */
 	while (1) {
 		__WFI();
 	}

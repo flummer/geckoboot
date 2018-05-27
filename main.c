@@ -69,6 +69,10 @@
 //#define DFU_UPLOAD
 //#define DFU_INTERFACE_NAME
 
+#define LED_RED   GPIO_PA8
+#define LED_GREEN GPIO_PA9
+#define LED_BLUE  GPIO_PA10
+
 struct usb_packet_setup {
 	union {
 		struct {
@@ -526,14 +530,14 @@ flash_write_page(const uint32_t *buf, uint32_t page)
 	while (flash_busy())
 		/* wait */;
 
-	gpio_clear(GPIO_PA8);
+	gpio_clear(LED_RED);
 	for (i = 0; i < FLASH_PAGE_SIZE/sizeof(uint32_t); i++) {
 		while (!flash_wdata_ready())
 			/* wait */;
 		flash_wdata(*buf++);
 		flash_write_once();
 	}
-	gpio_set(GPIO_PA8);
+	gpio_set(LED_RED);
 
 	return 0;
 }
@@ -1788,7 +1792,7 @@ USB_IRQHandler(void)
 
 	usb_flags_clear(flags);
 
-	gpio_clear(GPIO_PA9);
+	gpio_clear(LED_GREEN);
 
 	if (usb_flag_ep(flags)) {
 		usb_handle_transfer();
@@ -1817,7 +1821,7 @@ USB_IRQHandler(void)
 		debug("done\r\n");
 	}
 out:
-	gpio_set(GPIO_PA9);
+	gpio_set(LED_GREEN);
 }
 
 static void
@@ -1945,12 +1949,12 @@ main(void)
 
 	/* enable and configure GPIOs */
 	clock_gpio_enable();
-	gpio_set(GPIO_PA8);
-	gpio_set(GPIO_PA9);
-	//gpio_set(GPIO_PA10);
-	gpio_mode(GPIO_PA8,  GPIO_MODE_WIREDAND); /* red   LED */
-	gpio_mode(GPIO_PA9,  GPIO_MODE_WIREDAND); /* green LED */
-	//gpio_mode(GPIO_PA10, GPIO_MODE_WIREDAND); /* blue  LED */
+	gpio_set(LED_RED);
+	gpio_set(LED_GREEN);
+	//gpio_set(LED_BLUE);
+	gpio_mode(LED_RED,   GPIO_MODE_WIREDAND);
+	gpio_mode(LED_GREEN, GPIO_MODE_WIREDAND);
+	//gpio_mode(LED_BLUE,  GPIO_MODE_WIREDAND);
 #ifndef NDEBUG
 	gpio_mode(GPIO_PD4, GPIO_MODE_PUSHPULL); /* LEUART0 TX */
 	gpio_mode(GPIO_PD5, GPIO_MODE_INPUT);    /* LEUART0 RX */
@@ -1972,9 +1976,9 @@ main(void)
 	part_init();
 	dfu_status.bState = DFU_dfuIDLE;
 
-	gpio_clear(GPIO_PA9);
+	gpio_clear(LED_GREEN);
 	usb_init();
-	gpio_set(GPIO_PA9);
+	gpio_set(LED_GREEN);
 
 #ifndef NDEBUG
 	while (1) {

@@ -353,7 +353,7 @@ static const __align(4) struct inquiry_data inquiry_data = {
 	.additional_length    = 31,
 	.flags                = { 0x00, 0x00, 0x00 },
 	.vendor_id            = { 'L','a','b','i','t','a','t',' ' },
-	.product_id           = { 'G','e','c','k','o','n','a','t','o','r','B','o','o','t',' ',' ' },
+	.product_id           = { 'G','e','c','k','o','B','o','o','t',' ',' ',' ',' ',' ',' ',' ' },
 	.product_revision     = { '0','0','0','1' },
 };
 

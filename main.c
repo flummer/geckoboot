@@ -741,10 +741,6 @@ static int
 usb_handle_set_address(const struct usb_packet_setup *p, const void **data)
 {
 	debug("SET_ADDRESS: wValue = %hu\r\n", p->wValue);
-
-	if (p->wLength != 0)
-		return -1;
-
 	reboot_on_reset = true;
 	usb_set_address(p->wValue);
 	return 0;
@@ -831,10 +827,7 @@ usb_handle_set_configuration(const struct usb_packet_setup *p, const void **data
 	debug("SET_CONFIGURATION: wIndex = %hu, wValue = %hu\r\n",
 			p->wIndex, p->wValue);
 
-	if (p->wLength != 0)
-		return -1;
-
-	if (p->wValue == usb_descriptor_configuration[0]->bConfigurationValue) {
+	if (p->wIndex == 0 && p->wValue == usb_descriptor_configuration[0]->bConfigurationValue) {
 		/* configure mass-storage bulk endpoints */
 		USB->DIEP[USBMS_ENDPOINT-1].CTL = USB_DIEP_CTL_SNAK
 			| (USBMS_ENDPOINT << _USB_DIEP_CTL_TXFNUM_SHIFT)
@@ -862,9 +855,6 @@ usb_handle_set_interface(const struct usb_packet_setup *p, const void **data)
 {
 	debug("SET_INTERFACE: wIndex = %hu, wValue = %hu\r\n", p->wIndex, p->wValue);
 
-	if (p->wLength != 0)
-		return -1;
-
 	if (p->wIndex == USBMS_INTERFACE && p->wValue == 0)
 		return 0;
 	if (p->wIndex == DFU_INTERFACE && p->wValue == 0)
@@ -879,9 +869,6 @@ usb_handle_clear_feature_endpoint(const struct usb_packet_setup *p, const void *
 {
 	debug("CLEAR_FEATURE endpoint %hu\r\n", p->wIndex);
 
-	if (p->wLength != 0)
-		return -1;
-
 	if (p->wIndex == USBMS_ENDPOINT)
 		return 0;
 
@@ -891,7 +878,7 @@ usb_handle_clear_feature_endpoint(const struct usb_packet_setup *p, const void *
 static int
 usb_handle_mass_storage_reset(const struct usb_packet_setup *p, const void **data)
 {
-	if (p->wIndex != USBMS_INTERFACE || p->wLength != 0)
+	if (p->wIndex != USBMS_INTERFACE)
 		return -1;
 
 	debug("MASS_STORAGE_RESET\r\n");
@@ -1065,31 +1052,32 @@ usb_handle_dfu_abort(const struct usb_packet_setup *p, const void **data)
 
 struct usb_setup_handler {
 	uint16_t req;
+	int16_t len;
 	int (*fn)(const struct usb_packet_setup *p, const void **data);
 };
 
 static const struct usb_setup_handler usb_setup_handlers[] = {
 #ifdef USB_GET_STATUS_DEVICE
-	{ .req = 0x0080, .fn = usb_handle_get_status_device },
+	{ .req = 0x0080, .len = -1, .fn = usb_handle_get_status_device },
 #endif
-	{ .req = 0x0500, .fn = usb_handle_set_address },
-	{ .req = 0x0680, .fn = usb_handle_get_descriptor },
-	{ .req = 0x0880, .fn = usb_handle_get_configuration },
-	{ .req = 0x0900, .fn = usb_handle_set_configuration },
+	{ .req = 0x0500, .len =  0, .fn = usb_handle_set_address },
+	{ .req = 0x0680, .len = -1, .fn = usb_handle_get_descriptor },
+	{ .req = 0x0880, .len = -1, .fn = usb_handle_get_configuration },
+	{ .req = 0x0900, .len =  0, .fn = usb_handle_set_configuration },
 #ifdef USB_SET_INTERFACE
-	{ .req = 0x0b01, .fn = usb_handle_set_interface },
+	{ .req = 0x0b01, .len =  0, .fn = usb_handle_set_interface },
 #endif
-	{ .req = 0x0102, .fn = usb_handle_clear_feature_endpoint },
-	{ .req = 0xff21, .fn = usb_handle_mass_storage_reset },
-	{ .req = 0xfea1, .fn = usb_handle_get_max_lun, },
-	{ .req = 0x0121, .fn = usb_handle_dfu_dnload },
+	{ .req = 0x0102, .len =  0, .fn = usb_handle_clear_feature_endpoint },
+	{ .req = 0xff21, .len =  0, .fn = usb_handle_mass_storage_reset },
+	{ .req = 0xfea1, .len = -1, .fn = usb_handle_get_max_lun, },
+	{ .req = 0x0121, .len = -1, .fn = usb_handle_dfu_dnload },
 #ifdef DFU_UPLOAD
-	{ .req = 0x02a1, .fn = usb_handle_dfu_upload },
+	{ .req = 0x02a1, .len = -1, .fn = usb_handle_dfu_upload },
 #endif
-	{ .req = 0x03a1, .fn = usb_handle_dfu_getstatus },
-	{ .req = 0x0421, .fn = usb_handle_dfu_clrstatus },
-	{ .req = 0x05a1, .fn = usb_handle_dfu_getstate },
-	{ .req = 0x0621, .fn = usb_handle_dfu_abort },
+	{ .req = 0x03a1, .len = -1, .fn = usb_handle_dfu_getstatus },
+	{ .req = 0x0421, .len =  0, .fn = usb_handle_dfu_clrstatus },
+	{ .req = 0x05a1, .len = -1, .fn = usb_handle_dfu_getstate },
+	{ .req = 0x0621, .len =  0, .fn = usb_handle_dfu_abort },
 };
 
 static int
@@ -1099,8 +1087,11 @@ usb_setup_handler_run(const struct usb_packet_setup *p, const void **data)
 	const struct usb_setup_handler *end = h + ARRAY_SIZE(usb_setup_handlers);
 
 	for (; h < end; h++) {
-		if (h->req == p->request)
+		if (h->req == p->request) {
+			if (h->len >= 0 && (uint16_t)h->len != p->wLength)
+				break;
 			return h->fn(p, data);
+		}
 	}
 
 	debug("unknown request 0x%04x\r\n", p->request);

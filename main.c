@@ -75,7 +75,7 @@
 
 //#define DFU_STRICT
 //#define DFU_UPLOAD
-//#define DFU_INTERFACE_NAME
+#define DFU_INTERFACE_NAME
 
 #define LED_RED   GPIO_PA8
 #define LED_GREEN GPIO_PA9

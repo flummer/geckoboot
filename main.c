@@ -902,7 +902,7 @@ usb_handle_dfu_dnload(const struct usb_packet_setup *p, const void **data)
 #endif
 
 	if (p->wLength == 0) {
-		dfu_status.bState = DFU_dfuIDLE;
+		dfu_status.bState = DFU_dfuMANIFEST_SYNC;
 		return 0;
 	}
 
@@ -919,7 +919,7 @@ usb_handle_dfu_dnload(const struct usb_packet_setup *p, const void **data)
 		return 0;
 	}
 
-	dfu_status.bState = DFU_dfuDNLOAD_IDLE;
+	dfu_status.bState = DFU_dfuDNLOAD_SYNC;
 	return 0;
 }
 
@@ -955,6 +955,12 @@ usb_handle_dfu_getstatus(const struct usb_packet_setup *p, const void **data)
 	if (p->wIndex != DFU_INTERFACE)
 		return -1;
 #endif
+
+	if (dfu_status.bState == DFU_dfuDNLOAD_SYNC)
+		dfu_status.bState = DFU_dfuDNLOAD_IDLE;
+
+	if (dfu_status.bState == DFU_dfuMANIFEST_SYNC)
+		dfu_status.bState = DFU_dfuIDLE;
 
 	*data = &dfu_status;
 	return sizeof(dfu_status);

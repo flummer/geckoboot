@@ -74,7 +74,6 @@
 //#define USBMS_REPORT_LUNS
 
 //#define DFU_STRICT
-//#define DFU_DETACH
 //#define DFU_UPLOAD
 //#define DFU_INTERFACE_NAME
 
@@ -951,22 +950,6 @@ static __align(4) struct {
 	uint8_t iString;
 } dfu_status;
 
-#ifdef DFU_DETACH
-static int
-usb_handle_dfu_detach(const struct usb_packet_setup *p, const void **data)
-{
-	debug("DFU_DETACH: wValue = %hu, wIndex = %hu, wLength = %hu\r\n",
-			p->wValue, p->wIndex, p->wLength);
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
-
-	return 0;
-}
-#endif
-
 static int
 usb_handle_dfu_dnload(const struct usb_packet_setup *p, const void **data)
 {
@@ -1099,9 +1082,6 @@ static const struct usb_setup_handler usb_setup_handlers[] = {
 	{ .req = 0x0102, .fn = usb_handle_clear_feature_endpoint },
 	{ .req = 0xff21, .fn = usb_handle_mass_storage_reset },
 	{ .req = 0xfea1, .fn = usb_handle_get_max_lun, },
-#ifdef DFU_DETACH
-	{ .req = 0x0021, .fn = usb_handle_dfu_detach },
-#endif
 	{ .req = 0x0121, .fn = usb_handle_dfu_dnload },
 #ifdef DFU_UPLOAD
 	{ .req = 0x02a1, .fn = usb_handle_dfu_upload },

@@ -208,7 +208,7 @@ struct fat12_directory_entry {
 
 static const __align(4) struct usb_descriptor_device usb_descriptor_device = {
 	.bLength            = 18,
-	.bDescriptorType    = 1,
+	.bDescriptorType    = 0x01, /* Device */
 	.bcdUSB             = 0x0200,
 	.bDeviceClass       = 0x00, /* 0x00 = per interface */
 	.bDeviceSubClass    = 0x00,
@@ -291,7 +291,7 @@ static const struct usb_descriptor_configuration *const usb_descriptor_configura
 
 static const __align(4) struct usb_descriptor_string usb_descriptor_string0 = {
 	.bLength         = 4,
-	.bDescriptorType = 3,
+	.bDescriptorType = 0x03, /* String */
 	.wCodepoint = {
 		0x0409, /* English (US) */
 	},
@@ -299,7 +299,7 @@ static const __align(4) struct usb_descriptor_string usb_descriptor_string0 = {
 
 static const __align(4) struct usb_descriptor_string usb_descriptor_vendor = {
 	.bLength         = 16,
-	.bDescriptorType = 3,
+	.bDescriptorType = 0x03, /* String */
 	.wCodepoint = {
 		'L','a','b','i','t','a','t',
 	},
@@ -307,7 +307,7 @@ static const __align(4) struct usb_descriptor_string usb_descriptor_vendor = {
 
 static const __align(4) struct usb_descriptor_string usb_descriptor_product = {
 	.bLength         = 22,
-	.bDescriptorType = 3,
+	.bDescriptorType = 0x03, /* String */
 	.wCodepoint = {
 		'G','e','c','k','o','n','a','t','o','r',
 	},
@@ -317,7 +317,7 @@ static const __align(4) struct usb_descriptor_string usb_descriptor_product = {
  * at least according to the mass-storage bulk-only document */
 static const __align(4) struct usb_descriptor_string usb_descriptor_serial = {
 	.bLength         = 26,
-	.bDescriptorType = 3,
+	.bDescriptorType = 0x03, /* String */
 	.wCodepoint = {
 		'0','0','0','0','0','0','0','0','0','0','0','1',
 	},

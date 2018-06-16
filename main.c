@@ -26,11 +26,29 @@
 #include "lib/flash.c"
 #include "lib/usb.c"
 
+#define LEUART_DEBUG
 #ifdef NDEBUG
+#undef LEUART_DEBUG
 #define debug(...)
 #else
 #define debug(...) printf(__VA_ARGS__)
 #endif
+
+#define FLASH_TOTAL_PAGES  64U
+#ifdef NDEBUG
+#  define FLASH_PAGE_OFFSET   4U
+#else
+#  define FLASH_PAGE_OFFSET  32U
+#endif
+#define FLASH_ADDRESS      ((void *)FLASH_BASE)
+
+#define LED_RED   GPIO_PA8
+#define LED_GREEN GPIO_PA9
+#define LED_BLUE  GPIO_PA10
+
+#define USB_WORD(x) ((x) & 0xFF),((x) >> 8)
+#define USB_TRIPLE(x) ((x) & 0xFF),(((x) >> 8) & 0xFF),((x) >> 16)
+#define USB_QUAD(x) ((x) & 0xFF),(((x) >> 8) & 0xFF),(((x) >> 16) & 0xFF),((x) >> 24)
 
 #define USB_FIFO_RXSIZE  256
 #define USB_FIFO_TX0SIZE 128
@@ -44,19 +62,9 @@
 
 #define DFU_INTERFACE 1
 
-#define USB_WORD(x) ((x) & 0xFF),((x) >> 8)
-
 #define BE_UINT32(x) (((x) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | ((x) << 24))
 
 #define B2W(a,b,c,d) (((d)<<24)|((c)<<16)|((b)<<8)|(a))
-
-#define FLASH_TOTAL_PAGES  64U
-#ifdef NDEBUG
-#  define FLASH_PAGE_OFFSET   4U
-#else
-#  define FLASH_PAGE_OFFSET  32U
-#endif
-#define FLASH_ADDRESS      ((void *)FLASH_BASE)
 
 #define USB_GET_STATUS_DEVICE
 //#define USB_SET_INTERFACE
@@ -76,10 +84,6 @@
 //#define DFU_STRICT
 //#define DFU_UPLOAD
 #define DFU_INTERFACE_NAME
-
-#define LED_RED   GPIO_PA8
-#define LED_GREEN GPIO_PA9
-#define LED_BLUE  GPIO_PA10
 
 struct usb_packet_setup {
 	union {
@@ -326,7 +330,7 @@ static const __align(4) struct usb_descriptor_string usb_descriptor_serial = {
 #ifdef DFU_INTERFACE_NAME
 static const __align(4) struct usb_descriptor_string usb_descriptor_dfu_interface = {
 	.bLength         = 20,
-	.bDescriptorType = 3,
+	.bDescriptorType = 0x03, /* String */
 	.wCodepoint = {
 		'G','e','c','k','o','B','o','o','t',
 	},
@@ -420,9 +424,6 @@ static const __align(4) struct format_capacity_data format_capacity_data = {
 static struct {
 	uint32_t bytes;
 	uint32_t packetsize;
-#ifdef USB_FRAME_STATUS
-	uint32_t frame_status;
-#endif
 } usb_state;
 
 static __uninitialized uint32_t usb_outbuf[
@@ -467,12 +468,11 @@ static __uninitialized union {
 static unsigned int reboot_flag;
 static bool reboot_on_reset;
 
-#ifndef NDEBUG
+#ifdef LEUART_DEBUG
 static struct {
 	volatile uint32_t first;
 	volatile uint32_t last;
-	uint8_t buf[1024];
-	//uint8_t buf[2048];
+	uint8_t buf[2048];
 } leuart0_output;
 
 static void
@@ -492,19 +492,25 @@ void
 LEUART0_IRQHandler(void)
 {
 	uint32_t first = leuart0_output.first;
+	uint32_t last = leuart0_output.last;
 
-	if (first != leuart0_output.last) {
-		leuart0_txdata(leuart0_output.buf[first++]);
-		leuart0_output.first = first % ARRAY_SIZE(leuart0_output.buf);
-	} else
+	if (first == last) {
 		leuart0_flag_tx_buffer_level_disable();
-}
+		return;
+	}
 
+	leuart0_txdata(leuart0_output.buf[first++]);
+	leuart0_output.first = first % ARRAY_SIZE(leuart0_output.buf);
+}
+#endif
+
+#ifndef NDEBUG
 ssize_t
 _write(int fd, const uint8_t *ptr, size_t len)
 {
+#ifdef LEUART_DEBUG
 	leuart0_write(ptr, len);
-
+#endif
 	return len;
 }
 #endif
@@ -594,78 +600,33 @@ static void
 usb_suspend(void)
 {
 	usb_phy_stop();
-	/* TODO: power down more */
-	usb_flags_clear(~0U);
-	usb_flags_enable(USB_GINTMSK_WKUPINTMSK |
-	                 USB_GINTMSK_RESETDETMSK);
+	usb_flags_enable(USB_GINTMSK_WKUPINTMSK
+			| USB_GINTMSK_RESETDETMSK);
 }
 
 static void
 usb_unsuspend(void)
 {
-	/* disable interrupt */
-	NVIC_DisableIRQ(USB_IRQn);
-
 	usb_phy_start();
+	usb_flags_enable(USB_GINTMSK_ENUMDONEMSK
+			| USB_GINTMSK_USBRSTMSK
+			| USB_GINTMSK_USBSUSPMSK
+			| USB_GINTMSK_OEPINTMSK
+			| USB_GINTMSK_IEPINTMSK);
+}
 
-	usb_disconnect();
-	usb_core_reset();
-	while (usb_core_resetting())
-		/* wait */;
+static void
+usb_ep_reset(void)
+{
+	unsigned int i;
 
-	/* SiliconLabs code delay around 1us here */
+	usb_ep0out_config_64byte_stall();
+	for (i = 1; i < 4; i++)
+		usb_ep_out_config_disabled_nak(i);
 
-	/* wait for AHB master IDLE state */
-	while (!usb_ahb_idle())
-		/* wait */;
-
-	/* initialise USB core */
-	usb_ahb_config(USB_AHB_CONFIG_DMA_ENABLE |
-	               USB_AHB_CONFIG_BURST_INCR |
-	               USB_AHB_CONFIG_INTERRUPTS_ENABLE);
-	usb_flags_clear(~0U);
-	usb_flags_enable(USB_GINTMSK_ENUMDONEMSK |
-	                 USB_GINTMSK_USBRSTMSK |
-	                 USB_GINTMSK_USBSUSPMSK |
-	                 USB_GINTMSK_ERLYSUSPMSK |
-	                 USB_GINTMSK_OEPINTMSK |
-	                 USB_GINTMSK_IEPINTMSK);
-
-	/* initialize device */
-	USB->DCFG = USB_DCFG_RESVALID_DEFAULT
-	          | USB_DCFG_PERFRINT_80PCNT
-	          /* | USB_DCFG_ENA32KHZSUSP */
-	          | USB_DCFG_NZSTSOUTHSHK
-	          | USB_DCFG_DEVSPD_FS;
-
-	/* ignore frame numbers on iso transfers */
-	USB->DCTL = USB_DCTL_IGNRFRMNUM
-	          | USB_DCTL_PWRONPRGDONE
-	          | USB_DCTL_CGOUTNAK
-	          | USB_DCTL_SFTDISCON;
-
-	/* setup fifo allocation */
-	usb_allocate_buffers(USB_FIFO_RXSIZE,
-			USB_FIFO_TX0SIZE,
-			USB_FIFO_TX1SIZE,
-			USB_FIFO_TX2SIZE,
-			USB_FIFO_TX3SIZE);
-
-	/* stop all endpoints */
-	USB->DOEP0CTL = USB_DOEP0CTL_STALL | USB_DOEP0CTL_MPS_64B;
-	for (unsigned int i = 0; i < 3; i++)
-		USB->DOEP[i].CTL = USB_DOEP_CTL_SNAK;
-
-	USB->DIEP0CTL = USB_DIEP0CTL_STALL
-	              | (0 << _USB_DIEP0CTL_TXFNUM_SHIFT)
-	              | USB_DIEP0CTL_MPS_64B;
-	for (unsigned int i = 0; i < 3; i++)
-		USB->DIEP[i].CTL = USB_DIEP_CTL_SNAK;
-
-	/* enable interrupt */
-	NVIC_EnableIRQ(USB_IRQn);
-
-	usb_connect();
+	usb_ep0in_config_64byte_stall();
+	for (i = 1; i < 4; i++)
+		usb_ep_in_config_disabled_nak(i);
 }
 
 static void
@@ -674,31 +635,14 @@ usb_reset(void)
 	if (reboot_on_reset)
 		reboot();
 
-	/* configure DMA for endpoint 0 */
-	usb_ep0out_prepare_setup(&usb_outbuf);
-
-	/* stop all endpoints */
-	for (unsigned int i = 0; i < 3; i++)
-		USB->DOEP[i].CTL = USB_DOEP_CTL_SNAK;
-
-	usb_ep0in_stall();
-	for (unsigned int i = 0; i < 3; i++)
-		USB->DIEP[i].CTL = USB_DIEP_CTL_SNAK;
-
-	/* enable interrupts for endpoint 0 only */
-	USB->DAINTMSK = USB_DAINTMSK_INEPMSK0 | USB_DAINTMSK_OUTEPMSK0;
-	USB->DOEPMSK = USB_DOEPMSK_SETUPMSK
-	             | USB_DOEPMSK_XFERCOMPLMSK;
-	USB->DIEPMSK = USB_DIEPMSK_XFERCOMPLMSK
-	             | USB_DIEPMSK_TIMEOUTMSK;
+	usb_ep_reset();
 
 	usb_state.bytes = 0;
-#if 0
+
 	/* flush fifos */
 	usb_fifo_flush();
 	while (usb_fifo_flushing())
 		/* wait */;
-#endif
 }
 
 static void
@@ -712,10 +656,8 @@ usb_enumdone(void)
 	case 2:
 		debug("low speed.. ");
 		/* use 8 byte packages */
-		USB->DOEP0CTL = USB_DOEP0CTL_MPS_8B;
-		USB->DIEP0CTL = (0 << _USB_DIEP0CTL_TXFNUM_SHIFT)
-		              | USB_DIEP0CTL_MPS_8B;
-
+		usb_ep0out_config_8byte();
+		usb_ep0in_config_8byte();
 		usb_state.packetsize = 8;
 		break;
 	case 3:
@@ -724,6 +666,18 @@ usb_enumdone(void)
 		usb_state.packetsize = 64;
 		break;
 	}
+
+	/* prepare to receive setup package */
+	usb_ep0out_prepare_setup(&usb_outbuf);
+
+	/* enable interrupts for endpoint 0 only */
+	USB->DAINTMSK = USB_DAINTMSK_INEPMSK0 | USB_DAINTMSK_OUTEPMSK0;
+	USB->DOEPMSK = USB_DOEPMSK_SETUPMSK
+	             | USB_DOEPMSK_EPDISBLDMSK
+	             | USB_DOEPMSK_XFERCOMPLMSK;
+	USB->DIEPMSK = USB_DIEPMSK_TIMEOUTMSK
+	             | USB_DIEPMSK_EPDISBLDMSK
+	             | USB_DIEPMSK_XFERCOMPLMSK;
 }
 
 #ifdef USB_GET_STATUS_DEVICE
@@ -829,20 +783,11 @@ usb_handle_set_configuration(const struct usb_packet_setup *p, const void **data
 
 	if (p->wIndex == 0 && p->wValue == usb_descriptor_configuration[0]->bConfigurationValue) {
 		/* configure mass-storage bulk endpoints */
-		USB->DIEP[USBMS_ENDPOINT-1].CTL = USB_DIEP_CTL_SNAK
-			| (USBMS_ENDPOINT << _USB_DIEP_CTL_TXFNUM_SHIFT)
-			| USB_DIEP_CTL_EPTYPE_BULK
-			| USB_DIEP_CTL_USBACTEP
-			| USBMS_PACKETSIZE;
+		usb_ep_in_config_bulk(USBMS_ENDPOINT, USBMS_PACKETSIZE);
 		usb_ep_out_dma_address_set(USBMS_ENDPOINT, &usbms_buf);
 		usb_ep_out_transfer_size(USBMS_ENDPOINT, 1, USBMS_PACKETSIZE);
-		USB->DOEP[USBMS_ENDPOINT-1].CTL = USB_DOEP_CTL_EPENA
-			| USB_DOEP_CTL_CNAK
-			| USB_DOEP_CTL_EPTYPE_BULK
-			| USB_DOEP_CTL_USBACTEP
-			| USBMS_PACKETSIZE;
-
-		USB->DAINTMSK |= USB_DAINTMSK_INEPMSK1 | USB_DAINTMSK_OUTEPMSK1;
+		usb_ep_out_config_bulk_enabled(USBMS_ENDPOINT, USBMS_PACKETSIZE);
+		usb_ep_flag_inout_enable(USBMS_ENDPOINT);
 		return 0;
 	}
 
@@ -1783,13 +1728,13 @@ USB_IRQHandler(void)
 
 	gpio_clear(LED_GREEN);
 
-#ifdef USB_FRAME_STATUS
-	if (usb_flag_sof(flags))
-		usb_state.frame_status = usb_device_status();
-#endif
-
+	/* we ought to check the endpoint flag
+	 * but most likely we're interrupted because
+	 * of an endpoint, so just check endpoint
+	 * status every time
 	if (usb_flag_ep(flags))
-		usb_handle_endpoints();
+	*/
+	usb_handle_endpoints();
 
 	if (flags & (USB_GINTSTS_RESETDET | USB_GINTSTS_WKUPINT)) {
 		debug("WAKEUP.. ");
@@ -1865,19 +1810,15 @@ block_dump(uint8_t *page)
 static void
 usb_init(void)
 {
-#ifndef NDEBUG
-	NVIC_SetPriority(USB_IRQn, 0);
-#endif
-
 	/* enable USB clock */
 	clock_usb_enable();
-#if 1
-	USB->CTRL = 0;
-#else
-	USB->CTRL = USB_CTRL_LEMOSCCTRL_GATE
-	          | USB_CTRL_LEMIDLEEN
-	          | USB_CTRL_LEMPHYCTRL;
-#endif
+
+	/* gate usbc clock when bus is idle,
+	   signal full speed device */
+	usb_mode(USB_CTRL_LEMIDLEEN
+			| USB_CTRL_LEMOSCCTRL_GATE
+			| USB_CTRL_DMPUAP_LOW);
+
 	/* enable USB PHY pins */
 	usb_pins_enable();
 	/* enable USB and USB core clock */
@@ -1892,7 +1833,46 @@ usb_init(void)
 	while (!usb_ahb_idle())
 		/* wait */;
 
-	usb_unsuspend();
+	/* initialise USB core */
+	usb_ahb_config(USB_AHB_CONFIG_DMA_ENABLE
+			| USB_AHB_CONFIG_BURST_INCR
+			| USB_AHB_CONFIG_INTERRUPTS_ENABLE);
+	usb_flags_clear(~0U);
+	usb_flags_enable(USB_GINTMSK_ENUMDONEMSK
+			| USB_GINTMSK_USBRSTMSK
+			| USB_GINTMSK_USBSUSPMSK
+			| USB_GINTMSK_OEPINTMSK
+			| USB_GINTMSK_IEPINTMSK);
+
+	/* initialize device */
+	USB->DCFG = USB_DCFG_RESVALID_DEFAULT
+	          | USB_DCFG_PERFRINT_80PCNT
+	          /* | USB_DCFG_ENA32KHZSUSP */
+	          | USB_DCFG_NZSTSOUTHSHK
+	          | USB_DCFG_DEVSPD_FS;
+
+	/* ignore frame numbers on iso transfers */
+	USB->DCTL = USB_DCTL_IGNRFRMNUM
+	          | USB_DCTL_PWRONPRGDONE
+	          | USB_DCTL_CGOUTNAK
+	          | USB_DCTL_SFTDISCON;
+
+	/* setup fifo allocation */
+	usb_allocate_buffers(USB_FIFO_RXSIZE,
+			USB_FIFO_TX0SIZE,
+			USB_FIFO_TX1SIZE,
+			USB_FIFO_TX2SIZE,
+			USB_FIFO_TX3SIZE);
+
+	usb_ep_reset();
+
+	/* enable interrupt */
+#ifndef NDEBUG
+	NVIC_SetPriority(USB_IRQn, 1);
+#endif
+	NVIC_EnableIRQ(USB_IRQn);
+
+	usb_connect();
 }
 
 static inline uint8_t
@@ -1928,14 +1908,14 @@ main(void)
 	clock_auxhfrco_enable();
 
 	clock_le_enable();
-#ifdef NDEBUG
-	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_DISABLED | CLOCK_LFC_LFRCO);
-#else
+#ifdef LEUART_DEBUG
 	/* route 24MHz core clock / 2 / 8 to LEUART0 */
 	/* clock_le_div2(); bootup default */
 	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_CORECLK | CLOCK_LFC_LFRCO);
 	clock_leuart0_div8();
 	clock_leuart0_enable();
+#else
+	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_DISABLED | CLOCK_LFC_LFRCO);
 #endif
 	clock_usble_enable();
 	while (clock_lf_syncbusy())
@@ -1949,7 +1929,7 @@ main(void)
 	gpio_mode(LED_RED,   GPIO_MODE_WIREDAND);
 	gpio_mode(LED_GREEN, GPIO_MODE_WIREDAND);
 	//gpio_mode(LED_BLUE,  GPIO_MODE_WIREDAND);
-#ifndef NDEBUG
+#ifdef LEUART_DEBUG
 	gpio_mode(GPIO_PD4, GPIO_MODE_PUSHPULL); /* LEUART0 TX */
 	gpio_mode(GPIO_PD5, GPIO_MODE_INPUT);    /* LEUART0 RX */
 
@@ -1963,7 +1943,7 @@ main(void)
 		/* wait */;
 
 	/* enable interrupt */
-	NVIC_SetPriority(LEUART0_IRQn, 1);
+	NVIC_SetPriority(LEUART0_IRQn, 2);
 	NVIC_EnableIRQ(LEUART0_IRQn);
 #endif
 

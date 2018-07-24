@@ -96,58 +96,67 @@ __Vectors:
 .func Reset_Handler
 Reset_Handler:
 #ifdef NDEBUG
-	/* r2 = RMU_RSTCAUSE */
-	ldr	r0, =RMU_BASE
-	ldr	r2, [r0, #4]
+	/* r0 = RMU_RSTCAUSE */
+	ldr	r2, =RMU_BASE
+	ldr	r0, [r2, #4]
 	/* RMU_CMD = 1 (RMU_CMD_RCCLR) */
 	movs	r1, #1
-	str	r1, [r0, #8]
+	str	r1, [r2, #8]
 	/* EMU_AUXCTRL = 1 (EMU_AUXCTRL_HRCCLR) */
-	ldr	r0, =EMU_BASE
-	str	r1, [r0, #36]
+	ldr	r2, =EMU_BASE
+	str	r1, [r2, #36]
 	/* EMU_AUXCTRL = 0 */
 	movs	r3, #0
-	str	r3, [r0, #36]
-	/* test if r2 matches 0bXXX XXXX 1X00 */
+	str	r3, [r2, #36]
+	/* r2 = r0 = RMU_RSTCAUSE */
+	movs	r2, r0
+	/* test if r2 matches 0bXXX XXXX 1X00 (external reset) */
 	movs	r3, #11
 	ands	r2, r2, r3
 	cmp	r2, #8
 	beq	0f
 	/* SCB_VTOR = 4096 */
-	ldr	r0, =SCB_BASE
+	ldr	r2, =SCB_BASE
 	lsls	r1, r1, #12
-	str	r1, [r0, #8]
+	str	r1, [r2, #8]
 	/* sp = [4096] */
-	ldr	r0, [r1, #0]
-	mov	sp, r0
+	ldr	r2, [r1, #0]
+	mov	sp, r2
 	/* goto [4096 + 4] */
-	ldr	r0, [r1, #4]
-	bx	r0
+	ldr	r2, [r1, #4]
+	bx	r2
 .ltorg
 
 0:
 #endif /* NDEBUG */
-	/* copy data with *r1++ = *r0++ while r1 <= r2 */
-	ldr	r0, =__etext
-	ldr	r1, =__data_start__
-	ldr	r2, =__data_end__
+	/* copy data with *r5++ = *r4++ while r5 < r6 */
+	ldr	r4, =__etext
+	ldr	r5, =__data_start__
+	ldr	r6, =__data_end__
 	b	2f
-.ltorg
-1:	ldmia	r0!, {r4}
-	stmia	r1!, {r4}
-2:	cmp	r1, r2
-	bls	1b
+	/* .ltorg is possible here */
+1:	ldmia	r4!, {r7}
+	stmia	r5!, {r7}
+2:	cmp	r5, r6
+	blt	1b
 
-	/* clear bss with *r1++ = r0 (== 0) while r1 <= r2 */
-	movs	r0, #0
-	ldr	r1, =__bss_start__
-	ldr	r2, =__bss_end__
+	/* clear bss with *r5++ = r4 (== 0) while r5 < r6 */
+	movs	r4, #0
+	/* assume .bss follows .data
+	ldr	r5, =__bss_start__
+	*/
+	ldr	r6, =__bss_end__
+	/*
+	 * if .bss is empty we clear the first word of
+	 * whatever follows. that should be the bottom
+	 * of stack or start of heap which is fine
 	b	4f
-.ltorg
-3:	stmia	r1!, {r0}
-4:	cmp	r1, r2
-	bls	3b
+	 */
+3:	stmia	r5!, {r4}
+4:	cmp	r5, r6
+	blt	3b
 	bl	main
+	b	__halt
 .size Reset_Handler, . - Reset_Handler
 .endfunc
 

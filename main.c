@@ -20,11 +20,11 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#include "lib/clock.c"
-#include "lib/gpio.c"
-#include "lib/leuart0.c"
-#include "lib/flash.c"
-#include "lib/usb.c"
+#include "geckonator/clock.h"
+#include "geckonator/gpio.h"
+#include "geckonator/leuart0.h"
+#include "geckonator/flash.h"
+#include "geckonator/usb.h"
 
 #define LEUART_DEBUG
 #ifdef NDEBUG
@@ -68,6 +68,7 @@
 
 #define USB_GET_STATUS_DEVICE
 //#define USB_SET_INTERFACE
+//#define USB_CLEAR_FEATURE_ENDPOINT
 
 //#define USBMS_BLOCKSIZE 512U
 #define USBMS_BLOCKSIZE 1024U
@@ -81,11 +82,10 @@
 #define USBMS_READ_FORMAT_CAPACITY
 //#define USBMS_REPORT_LUNS
 
-//#define DFU_STRICT
 //#define DFU_UPLOAD
 #define DFU_INTERFACE_NAME
 
-struct usb_packet_setup {
+struct usb_setup_packet {
 	union {
 		struct {
 			uint8_t bmRequestType;
@@ -131,6 +131,13 @@ struct usb_descriptor_string {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint16_t wCodepoint[];
+};
+
+struct usb_setup_handler {
+	uint16_t req;
+	uint8_t idx;
+	uint8_t len;
+	int (*fn)(const struct usb_setup_packet *p, const void **data);
 };
 
 struct command_block_wrapper {
@@ -289,10 +296,6 @@ static const __align(4) struct usb_descriptor_configuration usb_descriptor_confi
 	}
 };
 
-static const struct usb_descriptor_configuration *const usb_descriptor_configuration[] = {
-	&usb_descriptor_configuration1,
-};
-
 static const __align(4) struct usb_descriptor_string usb_descriptor_string0 = {
 	.bLength         = 4,
 	.bDescriptorType = 0x03, /* String */
@@ -427,7 +430,7 @@ static struct {
 } usb_state;
 
 static __uninitialized uint32_t usb_outbuf[
-	(4*sizeof(struct usb_packet_setup) + FLASH_PAGE_SIZE) / sizeof(uint32_t)
+	(4*sizeof(struct usb_setup_packet) + FLASH_PAGE_SIZE) / sizeof(uint32_t)
 ];
 static __uninitialized union {
 	int8_t    i8[4];
@@ -467,53 +470,6 @@ static __uninitialized union {
 
 static unsigned int reboot_flag;
 static bool reboot_on_reset;
-
-#ifdef LEUART_DEBUG
-static struct {
-	volatile uint32_t first;
-	volatile uint32_t last;
-	uint8_t buf[2048];
-} leuart0_output;
-
-static void
-leuart0_write(const uint8_t *ptr, size_t len)
-{
-	uint32_t last = leuart0_output.last;
-
-	for (; len > 0; len--) {
-		leuart0_output.buf[last++] = *ptr++;
-		last %= ARRAY_SIZE(leuart0_output.buf);
-	}
-	leuart0_output.last = last;
-	leuart0_flag_tx_buffer_level_enable();
-}
-
-void
-LEUART0_IRQHandler(void)
-{
-	uint32_t first = leuart0_output.first;
-	uint32_t last = leuart0_output.last;
-
-	if (first == last) {
-		leuart0_flag_tx_buffer_level_disable();
-		return;
-	}
-
-	leuart0_txdata(leuart0_output.buf[first++]);
-	leuart0_output.first = first % ARRAY_SIZE(leuart0_output.buf);
-}
-#endif
-
-#ifndef NDEBUG
-ssize_t
-_write(int fd, const uint8_t *ptr, size_t len)
-{
-#ifdef LEUART_DEBUG
-	leuart0_write(ptr, len);
-#endif
-	return len;
-}
-#endif
 
 static __noreturn void
 reboot(void)
@@ -559,7 +515,7 @@ flash_write_page(const uint32_t *buf, uint32_t page)
 }
 
 static void
-dumpsetup(const struct usb_packet_setup *p)
+dumpsetup(const struct usb_setup_packet *p)
 {
 	debug("{\r\n"
 	      "  bmRequestType 0x%02x\r\n"
@@ -608,19 +564,12 @@ static void
 usb_suspend(void)
 {
 	usb_phy_stop();
-	usb_flags_enable(USB_GINTMSK_WKUPINTMSK
-			| USB_GINTMSK_RESETDETMSK);
 }
 
 static void
 usb_unsuspend(void)
 {
 	usb_phy_start();
-	usb_flags_enable(USB_GINTMSK_ENUMDONEMSK
-			| USB_GINTMSK_USBRSTMSK
-			| USB_GINTMSK_USBSUSPMSK
-			| USB_GINTMSK_OEPINTMSK
-			| USB_GINTMSK_IEPINTMSK);
 }
 
 static void
@@ -643,54 +592,49 @@ usb_reset(void)
 	if (reboot_on_reset)
 		reboot();
 
-	usb_ep_reset();
-
-	usb_state.bytes = 0;
-
 	/* flush fifos */
 	usb_fifo_flush();
 	while (usb_fifo_flushing())
 		/* wait */;
+
+	/* reset endpoint registers */
+	usb_ep_reset();
+
+	/* enable interrupts for endpoint 0 only */
+	usb_ep_flags_enable(USB_DAINTMSK_INEPMSK0 | USB_DAINTMSK_OUTEPMSK0);
+	usb_ep_out_flags_enable(USB_DOEPMSK_SETUPMSK
+			| USB_DOEPMSK_EPDISBLDMSK
+			| USB_DOEPMSK_XFERCOMPLMSK);
+	usb_ep_in_flags_enable(USB_DIEPMSK_TIMEOUTMSK
+			| USB_DIEPMSK_EPDISBLDMSK
+			| USB_DIEPMSK_XFERCOMPLMSK);
+
+	/* update internal state */
+	usb_state.bytes = 0;
 }
 
 static void
 usb_enumdone(void)
 {
-	switch (usb_enumerated_speed()) {
-	case 0:
-	case 1:
-		debug("\r\nERROR!\r\n");
-		return;
-	case 2:
-		debug("low speed.. ");
+	if (usb_speed_full()) {
+		/* we already set 64 byte packages at reset */
+		usb_state.packetsize = 64;
+		debug("full speed.. ");
+	} else {
 		/* use 8 byte packages */
 		usb_ep0out_config_8byte();
 		usb_ep0in_config_8byte();
 		usb_state.packetsize = 8;
-		break;
-	case 3:
-		debug("full speed.. ");
-		/* we already set 64 byte packages at reset */
-		usb_state.packetsize = 64;
-		break;
+		debug("low speed.. ");
 	}
 
 	/* prepare to receive setup package */
 	usb_ep0out_prepare_setup(&usb_outbuf);
-
-	/* enable interrupts for endpoint 0 only */
-	USB->DAINTMSK = USB_DAINTMSK_INEPMSK0 | USB_DAINTMSK_OUTEPMSK0;
-	USB->DOEPMSK = USB_DOEPMSK_SETUPMSK
-	             | USB_DOEPMSK_EPDISBLDMSK
-	             | USB_DOEPMSK_XFERCOMPLMSK;
-	USB->DIEPMSK = USB_DIEPMSK_TIMEOUTMSK
-	             | USB_DIEPMSK_EPDISBLDMSK
-	             | USB_DIEPMSK_XFERCOMPLMSK;
 }
 
 #ifdef USB_GET_STATUS_DEVICE
 static int
-usb_handle_get_status_device(const struct usb_packet_setup *p, const void **data)
+usb_handle_get_status_device(const struct usb_setup_packet *p, const void **data)
 {
 	debug("GET_STATUS device\r\n");
 	usb_inbuf.u16[0] = 0;
@@ -700,7 +644,7 @@ usb_handle_get_status_device(const struct usb_packet_setup *p, const void **data
 #endif
 
 static int
-usb_handle_set_address(const struct usb_packet_setup *p, const void **data)
+usb_handle_set_address(const struct usb_setup_packet *p, const void **data)
 {
 	debug("SET_ADDRESS: wValue = %hu\r\n", p->wValue);
 	reboot_on_reset = true;
@@ -723,16 +667,11 @@ usb_handle_get_descriptor_device(const void **data, uint8_t index)
 static int
 usb_handle_get_descriptor_configuration(const void **data, uint8_t index)
 {
-	const struct usb_descriptor_configuration *desc;
-
 	debug("GET_DESCRIPTOR: configuration %hu\r\n", index);
-	if (index >= ARRAY_SIZE(usb_descriptor_configuration)) {
-		debug("GET_DESCRIPTOR: unknown configuration %hu\r\n", index);
+	if (index != 0)
 		return -1;
-	}
-	desc = usb_descriptor_configuration[index];
-	*data = desc;
-	return desc->wTotalLength;
+	*data = &usb_descriptor_configuration1;
+	return usb_descriptor_configuration1.wTotalLength;
 }
 
 static int
@@ -751,7 +690,7 @@ usb_handle_get_descriptor_string(const void **data, uint8_t index)
 }
 
 static int
-usb_handle_get_descriptor(const struct usb_packet_setup *p, const void **data)
+usb_handle_get_descriptor(const struct usb_setup_packet *p, const void **data)
 {
 	uint8_t type = p->wValue >> 8;
 	uint8_t index = p->wValue & 0xFFU;
@@ -775,21 +714,21 @@ usb_handle_get_descriptor(const struct usb_packet_setup *p, const void **data)
 }
 
 static int
-usb_handle_get_configuration(const struct usb_packet_setup *p, const void **data)
+usb_handle_get_configuration(const struct usb_setup_packet *p, const void **data)
 {
 	debug("GET_CONFIGURATION\r\n");
-	usb_inbuf.u8[0] = usb_descriptor_configuration[0]->bConfigurationValue;
+	usb_inbuf.u8[0] = usb_descriptor_configuration1.bConfigurationValue;
 	*data = &usb_inbuf;
 	return 1;
 }
 
 static int
-usb_handle_set_configuration(const struct usb_packet_setup *p, const void **data)
+usb_handle_set_configuration(const struct usb_setup_packet *p, const void **data)
 {
 	debug("SET_CONFIGURATION: wIndex = %hu, wValue = %hu\r\n",
 			p->wIndex, p->wValue);
 
-	if (p->wIndex == 0 && p->wValue == usb_descriptor_configuration[0]->bConfigurationValue) {
+	if (p->wIndex == 0 && p->wValue == usb_descriptor_configuration1.bConfigurationValue) {
 		/* configure mass-storage bulk endpoints */
 		usb_ep_in_config_bulk(USBMS_ENDPOINT, USBMS_PACKETSIZE);
 		usb_ep_out_dma_address_set(USBMS_ENDPOINT, &usbms_buf);
@@ -804,46 +743,36 @@ usb_handle_set_configuration(const struct usb_packet_setup *p, const void **data
 
 #ifdef USB_SET_INTERFACE
 static int
-usb_handle_set_interface(const struct usb_packet_setup *p, const void **data)
+usb_handle_set_interface0(const struct usb_setup_packet *p, const void **data)
 {
 	debug("SET_INTERFACE: wIndex = %hu, wValue = %hu\r\n", p->wIndex, p->wValue);
 
-	if (p->wIndex == USBMS_INTERFACE && p->wValue == 0)
-		return 0;
-	if (p->wIndex == DFU_INTERFACE && p->wValue == 0)
+	if (p->wValue == 0)
 		return 0;
 
 	return -1;
 }
 #endif
 
+#ifdef USB_CLEAR_FEATURE_ENDPOINT
 static int
-usb_handle_clear_feature_endpoint(const struct usb_packet_setup *p, const void **data)
+usb_handle_clear_feature_endpoint(const struct usb_setup_packet *p, const void **data)
 {
 	debug("CLEAR_FEATURE endpoint %hu\r\n", p->wIndex);
-
-	if (p->wIndex == USBMS_ENDPOINT)
-		return 0;
-
-	return -1;
+	return 0;
 }
+#endif
 
 static int
-usb_handle_mass_storage_reset(const struct usb_packet_setup *p, const void **data)
+usbms_reset(const struct usb_setup_packet *p, const void **data)
 {
-	if (p->wIndex != USBMS_INTERFACE)
-		return -1;
-
 	debug("MASS_STORAGE_RESET\r\n");
 	return 0;
 }
 
 static int
-usb_handle_get_max_lun(const struct usb_packet_setup *p, const void **data)
+usbms_get_max_lun(const struct usb_setup_packet *p, const void **data)
 {
-	if (p->wIndex != USBMS_INTERFACE)
-		return -1;
-
 	debug("GET_MAX_LUN\r\n");
 	usb_inbuf.u8[0] = 0;
 	*data = &usb_inbuf;
@@ -891,15 +820,10 @@ static __align(4) struct {
 } dfu_status;
 
 static int
-usb_handle_dfu_dnload(const struct usb_packet_setup *p, const void **data)
+dfu_dnload(const struct usb_setup_packet *p, const void **data)
 {
 	debug("DFU_DNLOAD: wValue = %hu, wIndex = %hu, wLength = %hu\r\n",
 			p->wValue, p->wIndex, p->wLength);
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
 
 	if (p->wLength == 0) {
 		dfu_status.bState = DFU_dfuMANIFEST_SYNC;
@@ -925,15 +849,10 @@ usb_handle_dfu_dnload(const struct usb_packet_setup *p, const void **data)
 
 #ifdef DFU_UPLOAD
 static int
-usb_handle_dfu_upload(const struct usb_packet_setup *p, const void **data)
+dfu_upload(const struct usb_setup_packet *p, const void **data)
 {
 	debug("DFU_UPLOAD: wValue = %hu, wIndex = %hu, wLength = %hu\r\n",
 			p->wValue, p->wIndex, p->wLength);
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
 
 	if (p->wValue < (FLASH_TOTAL_PAGES - FLASH_PAGE_OFFSET)) {
 		dfu_status.bState = DFU_dfuUPLOAD_IDLE;
@@ -947,14 +866,9 @@ usb_handle_dfu_upload(const struct usb_packet_setup *p, const void **data)
 #endif
 
 static int
-usb_handle_dfu_getstatus(const struct usb_packet_setup *p, const void **data)
+dfu_getstatus(const struct usb_setup_packet *p, const void **data)
 {
 	debug("DFU_GETSTATUS\r\n");
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
 
 	if (dfu_status.bState == DFU_dfuDNLOAD_SYNC)
 		dfu_status.bState = DFU_dfuDNLOAD_IDLE;
@@ -967,14 +881,9 @@ usb_handle_dfu_getstatus(const struct usb_packet_setup *p, const void **data)
 }
 
 static int
-usb_handle_dfu_clrstatus(const struct usb_packet_setup *p, const void **data)
+dfu_clrstatus(const struct usb_setup_packet *p, const void **data)
 {
 	debug("DFU_CLRSTATUS\r\n");
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
 
 	dfu_status.bStatus = DFU_OK;
 	dfu_status.bState = DFU_dfuIDLE;
@@ -982,14 +891,9 @@ usb_handle_dfu_clrstatus(const struct usb_packet_setup *p, const void **data)
 }
 
 static int
-usb_handle_dfu_getstate(const struct usb_packet_setup *p, const void **data)
+dfu_getstate(const struct usb_setup_packet *p, const void **data)
 {
 	debug("DFU_GETSTATE\r\n");
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
 
 	usb_inbuf.u8[0] = dfu_status.bState;
 	*data = &usb_inbuf;
@@ -997,57 +901,54 @@ usb_handle_dfu_getstate(const struct usb_packet_setup *p, const void **data)
 }
 
 static int
-usb_handle_dfu_abort(const struct usb_packet_setup *p, const void **data)
+dfu_abort(const struct usb_setup_packet *p, const void **data)
 {
 	debug("DFU_ABORT\r\n");
-
-#ifdef DFU_STRICT
-	if (p->wIndex != DFU_INTERFACE)
-		return -1;
-#endif
-
 	return 0;
 }
 
-struct usb_setup_handler {
-	uint16_t req;
-	int16_t len;
-	int (*fn)(const struct usb_packet_setup *p, const void **data);
-};
-
 static const struct usb_setup_handler usb_setup_handlers[] = {
 #ifdef USB_GET_STATUS_DEVICE
-	{ .req = 0x0080, .len = -1, .fn = usb_handle_get_status_device },
+	{ .req = 0x0080, .idx =  0, .len = -1, .fn = usb_handle_get_status_device },
 #endif
-	{ .req = 0x0500, .len =  0, .fn = usb_handle_set_address },
-	{ .req = 0x0680, .len = -1, .fn = usb_handle_get_descriptor },
-	{ .req = 0x0880, .len = -1, .fn = usb_handle_get_configuration },
-	{ .req = 0x0900, .len =  0, .fn = usb_handle_set_configuration },
+	{ .req = 0x0500, .idx =  0, .len =  0, .fn = usb_handle_set_address },
+	{ .req = 0x0680, .idx = -1, .len = -1, .fn = usb_handle_get_descriptor },
+	{ .req = 0x0880, .idx =  0, .len = -1, .fn = usb_handle_get_configuration },
+	{ .req = 0x0900, .idx =  0, .len =  0, .fn = usb_handle_set_configuration },
+#ifdef USB_CLEAR_FEATURE_ENDPOINT
+	{ .req = 0x0102, .idx =  0, .len =  0, .fn = usb_handle_clear_feature_endpoint },
+#endif
 #ifdef USB_SET_INTERFACE
-	{ .req = 0x0b01, .len =  0, .fn = usb_handle_set_interface },
+	{ .req = 0x0b01, .idx = USBMS_INTERFACE, .len =  0, .fn = usb_handle_set_interface0 },
 #endif
-	{ .req = 0x0102, .len =  0, .fn = usb_handle_clear_feature_endpoint },
-	{ .req = 0xff21, .len =  0, .fn = usb_handle_mass_storage_reset },
-	{ .req = 0xfea1, .len = -1, .fn = usb_handle_get_max_lun, },
-	{ .req = 0x0121, .len = -1, .fn = usb_handle_dfu_dnload },
+	{ .req = 0xff21, .idx = USBMS_INTERFACE, .len =  0, .fn = usbms_reset },
+	{ .req = 0xfea1, .idx = USBMS_INTERFACE, .len = -1, .fn = usbms_get_max_lun, },
+#ifdef USB_CLEAR_FEATURE_ENDPOINT
+	{ .req = 0x0102, .idx = USBMS_ENDPOINT, .len = 0, .fn = usb_handle_clear_feature_endpoint },
+#endif
+#ifdef USB_SET_INTERFACE
+	{ .req = 0x0b01, .idx = DFU_INTERFACE, .len =  0, .fn = usb_handle_set_interface0 },
+#endif
+	{ .req = 0x0121, .idx = DFU_INTERFACE, .len = -1, .fn = dfu_dnload },
 #ifdef DFU_UPLOAD
-	{ .req = 0x02a1, .len = -1, .fn = usb_handle_dfu_upload },
+	{ .req = 0x02a1, .idx = DFU_INTERFACE, .len = -1, .fn = dfu_upload },
 #endif
-	{ .req = 0x03a1, .len = -1, .fn = usb_handle_dfu_getstatus },
-	{ .req = 0x0421, .len =  0, .fn = usb_handle_dfu_clrstatus },
-	{ .req = 0x05a1, .len = -1, .fn = usb_handle_dfu_getstate },
-	{ .req = 0x0621, .len =  0, .fn = usb_handle_dfu_abort },
+	{ .req = 0x03a1, .idx = DFU_INTERFACE, .len = -1, .fn = dfu_getstatus },
+	{ .req = 0x0421, .idx = DFU_INTERFACE, .len =  0, .fn = dfu_clrstatus },
+	{ .req = 0x05a1, .idx = DFU_INTERFACE, .len = -1, .fn = dfu_getstate },
+	{ .req = 0x0621, .idx = DFU_INTERFACE, .len =  0, .fn = dfu_abort },
 };
 
 static int
-usb_setup_handler_run(const struct usb_packet_setup *p, const void **data)
+usb_setup_handler_run(const struct usb_setup_packet *p, const void **data)
 {
 	const struct usb_setup_handler *h = usb_setup_handlers;
 	const struct usb_setup_handler *end = h + ARRAY_SIZE(usb_setup_handlers);
+	uint8_t idx = p->wIndex;
 
 	for (; h < end; h++) {
-		if (h->req == p->request) {
-			if (h->len >= 0 && (uint16_t)h->len != p->wLength)
+		if (h->req == p->request && (h->idx == 0xFFU || h->idx == idx)) {
+			if (h->len != 0xFFU && h->len != p->wLength)
 				break;
 			return h->fn(p, data);
 		}
@@ -1061,8 +962,8 @@ usb_setup_handler_run(const struct usb_packet_setup *p, const void **data)
 static void
 usb_handle_setup(void)
 {
-	const struct usb_packet_setup *p =
-		usb_ep0out_dma_address() - sizeof(struct usb_packet_setup);
+	const struct usb_setup_packet *p =
+		usb_ep0out_dma_address() - sizeof(struct usb_setup_packet);
 
 	usb_state.bytes = 0;
 
@@ -1095,7 +996,7 @@ usb_handle_setup(void)
 			usb_ep0out_prepare_setup(&usb_outbuf);
 			return;
 		}
-	} else if (p->wLength <= sizeof(usb_outbuf) - 4*sizeof(struct usb_packet_setup)) {
+	} else if (p->wLength <= sizeof(usb_outbuf) - 4*sizeof(struct usb_setup_packet)) {
 		uint32_t *rp = (uint32_t *)p;
 
 		if (rp != &usb_outbuf[0]) {
@@ -1833,8 +1734,6 @@ usb_init(void)
 			| USB_CTRL_LEMOSCCTRL_GATE
 			| USB_CTRL_DMPUAP_LOW);
 
-	/* enable USB PHY pins */
-	usb_pins_enable();
 	/* enable USB and USB core clock */
 	clock_usbc_enable();
 	/* make sure oscillator is ready and selected */
@@ -1848,28 +1747,36 @@ usb_init(void)
 		/* wait */;
 
 	/* initialise USB core */
-	usb_ahb_config(USB_AHB_CONFIG_DMA_ENABLE
-			| USB_AHB_CONFIG_BURST_INCR
-			| USB_AHB_CONFIG_INTERRUPTS_ENABLE);
-	usb_flags_clear(~0U);
-	usb_flags_enable(USB_GINTMSK_ENUMDONEMSK
-			| USB_GINTMSK_USBRSTMSK
-			| USB_GINTMSK_USBSUSPMSK
+	usb_ahb_config(USB_GAHBCFG_DMAEN
+			| USB_GAHBCFG_HBSTLEN_INCR
+			| USB_GAHBCFG_GLBLINTRMSK);
+	usb_flags_clear(~0UL);
+	usb_flags_enable(USB_GINTMSK_WKUPINTMSK
+			| USB_GINTMSK_RESETDETMSK
 			| USB_GINTMSK_OEPINTMSK
-			| USB_GINTMSK_IEPINTMSK);
+			| USB_GINTMSK_IEPINTMSK
+			| USB_GINTMSK_ENUMDONEMSK
+			| USB_GINTMSK_USBRSTMSK
+			| USB_GINTMSK_USBSUSPMSK);
 
-	/* initialize device */
-	USB->DCFG = USB_DCFG_RESVALID_DEFAULT
-	          | USB_DCFG_PERFRINT_80PCNT
-	          /* | USB_DCFG_ENA32KHZSUSP */
-	          | USB_DCFG_NZSTSOUTHSHK
-	          | USB_DCFG_DEVSPD_FS;
+	/* initialize device mode */
+	usb_device_config(USB_DCFG_RESVALID_DEFAULT
+			| USB_DCFG_PERFRINT_80PCNT
+			/* | USB_DCFG_ENA32KHZSUSP */
+			| USB_DCFG_NZSTSOUTHSHK
+			| USB_DCFG_DEVSPD_FS);
 
-	/* ignore frame numbers on iso transfers */
-	USB->DCTL = USB_DCTL_IGNRFRMNUM
-	          | USB_DCTL_PWRONPRGDONE
-	          | USB_DCTL_CGOUTNAK
-	          | USB_DCTL_SFTDISCON;
+	/* ignore frame numbers on iso transfers,
+	 * clear global nak flags, and disconnect
+	 * from the USB bus */
+	usb_device_control(USB_DCTL_IGNRFRMNUM
+			| USB_DCTL_PWRONPRGDONE
+			| USB_DCTL_CGOUTNAK
+			| USB_DCTL_CGNPINNAK
+			| USB_DCTL_SFTDISCON);
+
+	/* now that we're disconnected, enable USB phy pins */
+	usb_pins_enable();
 
 	/* setup fifo allocation */
 	usb_allocate_buffers(USB_FIFO_RXSIZE,
@@ -1878,6 +1785,7 @@ usb_init(void)
 			USB_FIFO_TX2SIZE,
 			USB_FIFO_TX3SIZE);
 
+	/* reset endpoint registers */
 	usb_ep_reset();
 
 	/* enable interrupt */
@@ -1886,8 +1794,86 @@ usb_init(void)
 #endif
 	NVIC_EnableIRQ(USB_IRQn);
 
+	/* tell the host we're here */
 	usb_connect();
 }
+
+#ifdef LEUART_DEBUG
+static struct {
+	volatile uint32_t first;
+	volatile uint32_t last;
+	uint8_t buf[2048];
+} leuart0_output;
+
+void
+LEUART0_IRQHandler(void)
+{
+	uint32_t first = leuart0_output.first;
+	uint32_t last = leuart0_output.last;
+
+	if (first == last) {
+		leuart0_flag_tx_buffer_level_disable();
+		return;
+	}
+
+	leuart0_txdata(leuart0_output.buf[first++]);
+	leuart0_output.first = first % ARRAY_SIZE(leuart0_output.buf);
+}
+
+static void
+leuart0_write(const uint8_t *ptr, size_t len)
+{
+	uint32_t last = leuart0_output.last;
+
+	for (; len > 0; len--) {
+		leuart0_output.buf[last++] = *ptr++;
+		last %= ARRAY_SIZE(leuart0_output.buf);
+	}
+	leuart0_output.last = last;
+	leuart0_flag_tx_buffer_level_enable();
+}
+
+static void
+leuart0_init(void)
+{
+	/* route 24MHz core clock / 2 / 8 to LEUART0 */
+	/* clock_le_div2(); bootup default */
+	clock_lfb_select_hfclk();
+	clock_leuart0_div8();
+	clock_leuart0_enable();
+	while (clock_lf_syncbusy())
+		/* wait */;
+
+	gpio_mode(GPIO_PD4, GPIO_MODE_PUSHPULL); /* LEUART0 TX */
+	gpio_mode(GPIO_PD5, GPIO_MODE_INPUT);    /* LEUART0 RX */
+
+	leuart0_freeze();
+	leuart0_config(LEUART_CONFIG_8N1);
+	leuart0_clock_div(3077); /* 256*(f/115200 - 1), f = 24MHz / 2 / 8 */
+	leuart0_pins(LEUART_PINS_RXTX0); /* RX -> PD5, TX -> PD4 */
+	leuart0_rxtx_enable();
+	leuart0_update();
+	while (leuart0_syncbusy())
+		/* wait */;
+
+	/* enable interrupt */
+	NVIC_SetPriority(LEUART0_IRQn, 2);
+	NVIC_EnableIRQ(LEUART0_IRQn);
+}
+#else
+static inline void leuart0_init(void) {}
+#endif
+
+#ifndef NDEBUG
+ssize_t __used
+_write(int fd, const uint8_t *ptr, size_t len)
+{
+#ifdef LEUART_DEBUG
+	leuart0_write(ptr, len);
+#endif
+	return len;
+}
+#endif
 
 static inline uint8_t
 system_getprodrev(void)
@@ -1922,15 +1908,7 @@ main(void)
 	clock_auxhfrco_enable();
 
 	clock_le_enable();
-#ifdef LEUART_DEBUG
-	/* route 24MHz core clock / 2 / 8 to LEUART0 */
-	/* clock_le_div2(); bootup default */
-	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_CORECLK | CLOCK_LFC_LFRCO);
-	clock_leuart0_div8();
-	clock_leuart0_enable();
-#else
 	clock_lf_config(CLOCK_LFA_DISABLED | CLOCK_LFB_DISABLED | CLOCK_LFC_LFRCO);
-#endif
 	clock_usble_enable();
 	while (clock_lf_syncbusy())
 		/* wait */;
@@ -1943,23 +1921,10 @@ main(void)
 	gpio_mode(LED_RED,   GPIO_MODE_WIREDAND);
 	gpio_mode(LED_GREEN, GPIO_MODE_WIREDAND);
 	//gpio_mode(LED_BLUE,  GPIO_MODE_WIREDAND);
-#ifdef LEUART_DEBUG
-	gpio_mode(GPIO_PD4, GPIO_MODE_PUSHPULL); /* LEUART0 TX */
-	gpio_mode(GPIO_PD5, GPIO_MODE_INPUT);    /* LEUART0 RX */
 
-	leuart0_freeze();
-	leuart0_config(LEUART_CONFIG_8N1);
-	leuart0_clock_div(3077); /* 256*(f/115200 - 1), f = 24MHz / 2 / 8 */
-	leuart0_pins(LEUART_PINS_RXTX0); /* RX -> PD5, TX -> PD4 */
-	leuart0_rxtx_enable();
-	leuart0_update();
-	while (leuart0_syncbusy())
-		/* wait */;
+	leuart0_init();
 
-	/* enable interrupt */
-	NVIC_SetPriority(LEUART0_IRQn, 2);
-	NVIC_EnableIRQ(LEUART0_IRQn);
-#endif
+	debug("\r\nHello World!\r\n");
 
 	part_init();
 	dfu_status.bState = DFU_dfuIDLE;

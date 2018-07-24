@@ -110,6 +110,13 @@ Reset_Handler:
 	str	r3, [r2, #36]
 	/* r2 = r0 = RMU_RSTCAUSE */
 	movs	r2, r0
+#ifndef SOFTWARE_BOOT
+	/* test if r2 matches 0b000 01X0 0000 (software reset) */
+	movs	r3, #32
+	bics	r2, r2, r3
+	cmp	r2, #64
+	beq	0f
+#endif
 	/* test if r2 matches 0bXXX XXXX 1X00 (external reset) */
 	movs	r3, #11
 	ands	r2, r2, r3

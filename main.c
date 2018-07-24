@@ -519,7 +519,15 @@ static __noreturn void
 reboot(void)
 {
 	usb_disconnect();
-	NVIC_SystemReset();
+	WDOG->CTRL = WDOG_CTRL_CLKSEL_LFRCO
+		| (0 << _WDOG_CTRL_PERSEL_SHIFT)
+		| WDOG_CTRL_EM4BLOCK
+		| WDOG_CTRL_LOCK
+		| WDOG_CTRL_EN;
+
+	while (1)
+		/* wait for watchdog to reset us */;
+
 	__builtin_unreachable();
 }
 

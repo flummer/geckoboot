@@ -578,12 +578,18 @@ usb_ep_reset(void)
 	unsigned int i;
 
 	usb_ep0out_config_64byte_stall();
-	for (i = 1; i < 4; i++)
+	usb_ep0out_flags_clear(~0UL);
+	for (i = 1; i < 4; i++) {
 		usb_ep_out_config_disabled_nak(i);
+		usb_ep_out_flags_clear(i, ~0UL);
+	}
 
 	usb_ep0in_config_64byte_stall();
-	for (i = 1; i < 4; i++)
+	usb_ep0in_flags_clear(~0UL);
+	for (i = 1; i < 4; i++) {
 		usb_ep_in_config_disabled_nak(i);
+		usb_ep_in_flags_clear(i, ~0UL);
+	}
 }
 
 static void
@@ -599,6 +605,9 @@ usb_reset(void)
 
 	/* reset endpoint registers */
 	usb_ep_reset();
+
+	/* reset address */
+	usb_set_address(0);
 
 	/* enable interrupts for endpoint 0 only */
 	usb_ep_flags_enable(USB_DAINTMSK_INEPMSK0 | USB_DAINTMSK_OUTEPMSK0);

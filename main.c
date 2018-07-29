@@ -56,11 +56,11 @@
 #define USB_FIFO_TX2SIZE 0
 #define USB_FIFO_TX3SIZE 0
 
-#define USBMS_INTERFACE 0
+#define DFU_INTERFACE 0
+
+#define USBMS_INTERFACE 1
 #define USBMS_ENDPOINT 1
 #define USBMS_PACKETSIZE 64
-
-#define DFU_INTERFACE 1
 
 #define BE_UINT32(x) (((x) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | ((x) << 24))
 
@@ -69,6 +69,9 @@
 #define USB_GET_STATUS_DEVICE
 //#define USB_SET_INTERFACE
 //#define USB_CLEAR_FEATURE_ENDPOINT
+
+//#define DFU_UPLOAD
+#define DFU_INTERFACE_NAME
 
 //#define USBMS_BLOCKSIZE 512U
 #define USBMS_BLOCKSIZE 1024U
@@ -81,9 +84,6 @@
 //#define USBMS_MODE_SENSE_CACHE_DATA
 #define USBMS_READ_FORMAT_CAPACITY
 //#define USBMS_REPORT_LUNS
-
-//#define DFU_UPLOAD
-#define DFU_INTERFACE_NAME
 
 struct usb_setup_packet {
 	union {
@@ -247,30 +247,6 @@ static const __align(4) struct usb_descriptor_configuration usb_descriptor_confi
 	/* Interface */
 	/* .bLength            */ 9,
 	/* .bDescriptorType    */ 0x04, /* Interface */
-	/* .bInterfaceNumber   */ USBMS_INTERFACE,
-	/* .bAlternateSetting  */ 0,
-	/* .bNumEndpoints      */ 2,
-	/* .bInterfaceClass    */ 0x08, /* 0x08 = Mass-Storage Class */
-	/* .bInterfaceSubClass */ 0x06, /* 0x06 = SCSI transparent command set */
-	/* .bInterfaceProtocol */ 0x50, /* 0x50 = Bulk-Only Transport (BBB) */
-	/* .iInterface         */ 0,
-	/* Endpoint */
-	/* .bLength            */ 7,
-	/* .bDescriptorType    */ 0x05, /* Endpoint */
-	/* .bEndpointAddress   */ 0x80 | USBMS_ENDPOINT, /* in */
-	/* .bmAttributes       */ 0x02, /* bulk, data endpoint */
-	/* .wMaxPacketSize     */ USB_WORD(USBMS_PACKETSIZE),
-	/* .bInterval          */ 0,    /* unused */
-	/* Endpoint */
-	/* .bLength            */ 7,
-	/* .bDescriptorType    */ 0x05, /* Endpoint */
-	/* .bEndpointAddress   */ USBMS_ENDPOINT, /* out */
-	/* .bmAttributes       */ 0x02, /* bulk, data endpoint */
-	/* .wMaxPacketSize     */ USB_WORD(USBMS_PACKETSIZE),
-	/* .bInterval          */ 0,    /* unused */
-	/* Interface */
-	/* .bLength            */ 9,
-	/* .bDescriptorType    */ 0x04, /* Interface */
 	/* .bInterfaceNumber   */ DFU_INTERFACE,
 	/* .bAlternateSetting  */ 0,
 	/* .bNumEndpoints      */ 0,    /* only the control pipe is used */
@@ -293,6 +269,30 @@ static const __align(4) struct usb_descriptor_configuration usb_descriptor_confi
 	/* .wDetachTimeOut     */ USB_WORD(500), /* 500ms */
 	/* .wTransferSize      */ USB_WORD(FLASH_PAGE_SIZE),
 	/* .bcdDFUVersion      */ USB_WORD(0x0101), /* DFU v1.1 */
+	/* Interface */
+	/* .bLength            */ 9,
+	/* .bDescriptorType    */ 0x04, /* Interface */
+	/* .bInterfaceNumber   */ USBMS_INTERFACE,
+	/* .bAlternateSetting  */ 0,
+	/* .bNumEndpoints      */ 2,
+	/* .bInterfaceClass    */ 0x08, /* 0x08 = Mass-Storage Class */
+	/* .bInterfaceSubClass */ 0x06, /* 0x06 = SCSI transparent command set */
+	/* .bInterfaceProtocol */ 0x50, /* 0x50 = Bulk-Only Transport (BBB) */
+	/* .iInterface         */ 0,
+	/* Endpoint */
+	/* .bLength            */ 7,
+	/* .bDescriptorType    */ 0x05, /* Endpoint */
+	/* .bEndpointAddress   */ 0x80 | USBMS_ENDPOINT, /* in */
+	/* .bmAttributes       */ 0x02, /* bulk, data endpoint */
+	/* .wMaxPacketSize     */ USB_WORD(USBMS_PACKETSIZE),
+	/* .bInterval          */ 0,    /* unused */
+	/* Endpoint */
+	/* .bLength            */ 7,
+	/* .bDescriptorType    */ 0x05, /* Endpoint */
+	/* .bEndpointAddress   */ USBMS_ENDPOINT, /* out */
+	/* .bmAttributes       */ 0x02, /* bulk, data endpoint */
+	/* .wMaxPacketSize     */ USB_WORD(USBMS_PACKETSIZE),
+	/* .bInterval          */ 0,    /* unused */
 	}
 };
 
@@ -772,22 +772,6 @@ usb_handle_clear_feature_endpoint(const struct usb_setup_packet *p, const void *
 }
 #endif
 
-static int
-usbms_reset(const struct usb_setup_packet *p, const void **data)
-{
-	debug("MASS_STORAGE_RESET\r\n");
-	return 0;
-}
-
-static int
-usbms_get_max_lun(const struct usb_setup_packet *p, const void **data)
-{
-	debug("GET_MAX_LUN\r\n");
-	usb_inbuf.u8[0] = 0;
-	*data = &usb_inbuf;
-	return 1;
-}
-
 enum dfu_status {
 	DFU_OK,
 	DFU_errTARGET,
@@ -916,6 +900,22 @@ dfu_abort(const struct usb_setup_packet *p, const void **data)
 	return 0;
 }
 
+static int
+usbms_reset(const struct usb_setup_packet *p, const void **data)
+{
+	debug("MASS_STORAGE_RESET\r\n");
+	return 0;
+}
+
+static int
+usbms_get_max_lun(const struct usb_setup_packet *p, const void **data)
+{
+	debug("GET_MAX_LUN\r\n");
+	usb_inbuf.u8[0] = 0;
+	*data = &usb_inbuf;
+	return 1;
+}
+
 static const struct usb_setup_handler usb_setup_handlers[] = {
 #ifdef USB_GET_STATUS_DEVICE
 	{ .req = 0x0080, .idx =  0, .len = -1, .fn = usb_handle_get_status_device },
@@ -928,14 +928,6 @@ static const struct usb_setup_handler usb_setup_handlers[] = {
 	{ .req = 0x0102, .idx =  0, .len =  0, .fn = usb_handle_clear_feature_endpoint },
 #endif
 #ifdef USB_SET_INTERFACE
-	{ .req = 0x0b01, .idx = USBMS_INTERFACE, .len =  0, .fn = usb_handle_set_interface0 },
-#endif
-	{ .req = 0xff21, .idx = USBMS_INTERFACE, .len =  0, .fn = usbms_reset },
-	{ .req = 0xfea1, .idx = USBMS_INTERFACE, .len = -1, .fn = usbms_get_max_lun, },
-#ifdef USB_CLEAR_FEATURE_ENDPOINT
-	{ .req = 0x0102, .idx = USBMS_ENDPOINT, .len = 0, .fn = usb_handle_clear_feature_endpoint },
-#endif
-#ifdef USB_SET_INTERFACE
 	{ .req = 0x0b01, .idx = DFU_INTERFACE, .len =  0, .fn = usb_handle_set_interface0 },
 #endif
 	{ .req = 0x0121, .idx = DFU_INTERFACE, .len = -1, .fn = dfu_dnload },
@@ -946,6 +938,14 @@ static const struct usb_setup_handler usb_setup_handlers[] = {
 	{ .req = 0x0421, .idx = DFU_INTERFACE, .len =  0, .fn = dfu_clrstatus },
 	{ .req = 0x05a1, .idx = DFU_INTERFACE, .len = -1, .fn = dfu_getstate },
 	{ .req = 0x0621, .idx = DFU_INTERFACE, .len =  0, .fn = dfu_abort },
+#ifdef USB_SET_INTERFACE
+	{ .req = 0x0b01, .idx = USBMS_INTERFACE, .len =  0, .fn = usb_handle_set_interface0 },
+#endif
+	{ .req = 0xff21, .idx = USBMS_INTERFACE, .len =  0, .fn = usbms_reset },
+	{ .req = 0xfea1, .idx = USBMS_INTERFACE, .len = -1, .fn = usbms_get_max_lun, },
+#ifdef USB_CLEAR_FEATURE_ENDPOINT
+	{ .req = 0x0102, .idx = USBMS_ENDPOINT, .len = 0, .fn = usb_handle_clear_feature_endpoint },
+#endif
 };
 
 static int

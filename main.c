@@ -42,9 +42,10 @@
 #endif
 #define FLASH_ADDRESS      ((void *)FLASH_BASE)
 
-#define LED_RED   GPIO_PA8
-#define LED_GREEN GPIO_PA9
-#define LED_BLUE  GPIO_PA10
+#define LED_FLASH GPIO_PA9
+//#define LED_USB   GPIO_PA10
+#define LED_ON    GPIO_PA8
+#define BTN_EXIT  GPIO_PC4
 
 #define USB_WORD(x) ((x) & 0xFF),((x) >> 8)
 #define USB_TRIPLE(x) ((x) & 0xFF),(((x) >> 8) & 0xFF),((x) >> 16)
@@ -498,19 +499,22 @@ flash_write_page(const uint32_t *buf, uint32_t page)
 	if (flash_address_invalid())
 		return 1;
 
+#ifdef LED_FLASH
+	gpio_clear(LED_FLASH);
+#endif
 	flash_erase_page();
 	while (flash_busy())
 		/* wait */;
 
-	gpio_clear(LED_RED);
 	for (i = 0; i < FLASH_PAGE_SIZE/sizeof(uint32_t); i++) {
 		while (!flash_wdata_ready())
 			/* wait */;
 		flash_wdata(*buf++);
 		flash_write_once();
 	}
-	gpio_set(LED_RED);
-
+#ifdef LED_FLASH
+	gpio_set(LED_FLASH);
+#endif
 	return 0;
 }
 
@@ -1650,8 +1654,9 @@ USB_IRQHandler(void)
 
 	usb_flags_clear(flags);
 
-	gpio_clear(LED_GREEN);
-
+#ifdef LED_USB
+	gpio_clear(LED_USB);
+#endif
 	/* we ought to check the endpoint flag
 	 * but most likely we're interrupted because
 	 * of an endpoint, so just check endpoint
@@ -1683,7 +1688,11 @@ USB_IRQHandler(void)
 		debug("done\r\n");
 	}
 out:
-	gpio_set(LED_GREEN);
+#ifdef LED_USB
+	gpio_set(LED_USB);
+#else
+	;
+#endif
 }
 
 static void
@@ -1924,12 +1933,18 @@ main(void)
 
 	/* enable and configure GPIOs */
 	clock_gpio_enable();
-	gpio_set(LED_RED);
-	gpio_set(LED_GREEN);
-	//gpio_set(LED_BLUE);
-	gpio_mode(LED_RED,   GPIO_MODE_WIREDAND);
-	gpio_mode(LED_GREEN, GPIO_MODE_WIREDAND);
-	//gpio_mode(LED_BLUE,  GPIO_MODE_WIREDAND);
+#ifdef LED_FLASH
+	gpio_set(LED_FLASH);
+	gpio_mode(LED_FLASH, GPIO_MODE_WIREDAND);
+#endif
+#ifdef LED_USB
+	gpio_set(LED_USB);
+	gpio_mode(LED_USB, GPIO_MODE_WIREDAND);
+#endif
+#ifdef LED_ON
+	gpio_clear(LED_ON);
+	gpio_mode(LED_ON, GPIO_MODE_WIREDAND);
+#endif
 
 	leuart0_init();
 
@@ -1938,9 +1953,13 @@ main(void)
 	part_init();
 	dfu_status.bState = DFU_dfuIDLE;
 
-	gpio_clear(LED_GREEN);
+#ifdef LED_USB
+	gpio_clear(LED_USB);
+#endif
 	usb_init();
-	gpio_set(LED_GREEN);
+#ifdef LED_USB
+	gpio_set(LED_USB);
+#endif
 
 #ifndef NDEBUG
 	while (1) {

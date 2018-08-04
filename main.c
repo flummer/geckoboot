@@ -1893,6 +1893,19 @@ _write(int fd, const uint8_t *ptr, size_t len)
 }
 #endif
 
+#ifdef BTN_EXIT
+void
+GPIO_EVEN_IRQHandler(void)
+{
+#if 0
+	uint32_t flags = gpio_flags();
+
+	if (gpio_flag(flags, BTN_EXIT))
+#endif
+		reboot();
+}
+#endif
+
 static inline uint8_t
 system_getprodrev(void)
 {
@@ -1944,6 +1957,16 @@ main(void)
 #ifdef LED_ON
 	gpio_clear(LED_ON);
 	gpio_mode(LED_ON, GPIO_MODE_WIREDAND);
+#endif
+#ifdef BTN_EXIT
+	gpio_set(BTN_EXIT);
+	gpio_mode(BTN_EXIT, GPIO_MODE_INPUTPULLFILTER);
+	gpio_flag_select(BTN_EXIT);
+	gpio_flag_falling_enable(BTN_EXIT);
+	gpio_flag_clear(BTN_EXIT);
+	gpio_flag_enable(BTN_EXIT);
+	//NVIC_SetPriority(GPIO_EVEN_IRQn, 3);
+	NVIC_EnableIRQ(GPIO_EVEN_IRQn);
 #endif
 
 	leuart0_init();

@@ -57,6 +57,12 @@
 #define USB_FIFO_TX2SIZE 0
 #define USB_FIFO_TX3SIZE 0
 
+/* this vid/pid are given to us by openmoko
+ * https://github.com/openmoko/openmoko-usb-oui
+ */
+#define USB_VID 0x1d50U
+#define USB_PID 0x613eU
+
 #define DFU_INTERFACE 0
 
 #define USBMS_INTERFACE 1
@@ -226,8 +232,8 @@ static const __align(4) struct usb_descriptor_device usb_descriptor_device = {
 	.bDeviceSubClass    = 0x00,
 	.bDeviceProtocol    = 0x00,
 	.bMaxPacketSize0    = 64,
-	.idVendor           = 0x0483,
-	.idProduct          = 0xdf11,
+	.idVendor           = USB_VID,
+	.idProduct          = USB_PID,
 	.bcdDevice          = 0x0200,
 	.iManufacturer      = 1,
 	.iProduct           = 2,
